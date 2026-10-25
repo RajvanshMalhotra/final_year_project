@@ -79,18 +79,36 @@ class Scenario:
     def make_cluster(self) -> SimulatedCluster:
         return SimulatedCluster(seed=self.seed, **self.cluster_kwargs)
 
+    @property
+    def normal_speeds(self) -> Dict[str, float]:
+        return {mid: m.normal_speed for mid, m in self.make_cluster().machines.items()}
+
 
 def _lognormal_ticks(rng: random.Random, median: float, sigma: float,
                      lo: int = 2, hi: int = 600) -> int:
     return int(min(hi, max(lo, round(rng.lognormvariate(math.log(median), sigma)))))
 
 
-def make_scenario(seed: int, difficulty: str = "realistic", total_steps: int = 1000) -> Scenario:
+def _calibrated(kwargs: Dict, difficulty: str, calibration) -> Dict:
+    """Measured speeds everywhere; measured all-reduce time scaled by the level's stress
+    (hard/chaos keep their extra network cost relative to realistic). Easy has no comm."""
+    if calibration is None:
+        return kwargs
+    out = dict(kwargs, normal_speeds=dict(calibration.speeds))
+    if difficulty != "easy":
+        out["comm_s"] = calibration.comm_s * LEVELS[difficulty].comm_s / LEVELS["realistic"].comm_s
+    return out
+
+
+def make_scenario(seed: int, difficulty: str = "realistic", total_steps: int = 1000,
+                  calibration=None) -> Scenario:
+    """calibration: a calibration.Calibration (measured laptop numbers), or None for the
+    built-in estimates. The fault schedule is the same either way."""
     if difficulty not in DIFFICULTIES:
         raise ValueError(f"difficulty must be one of {DIFFICULTIES}, got {difficulty!r}")
     if difficulty == "easy":
         gen = RandomFaultGenerator(seed=seed, total_steps=total_steps)
-        return Scenario(seed, difficulty, gen.as_schedule(), {})
+        return Scenario(seed, difficulty, gen.as_schedule(), _calibrated({}, difficulty, calibration))
 
     L   = LEVELS[difficulty]
     rng = random.Random(f"{difficulty}-{seed}")
@@ -142,4 +160,4 @@ def make_scenario(seed: int, difficulty: str = "realistic", total_steps: int = 1
 
     kwargs = dict(noise_std=L.noise_std, spike_prob=L.spike_prob, comm_s=L.comm_s,
                   max_share={"mac-m2": L.mac_cap})
-    return Scenario(seed, difficulty, FaultSchedule(ev), kwargs)
+    return Scenario(seed, difficulty, FaultSchedule(ev), _calibrated(kwargs, difficulty, calibration))

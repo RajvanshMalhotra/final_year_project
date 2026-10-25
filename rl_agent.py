@@ -141,8 +141,10 @@ class GymClusterEnv(gym.Env):
         difficulties: Sequence[str] = ("realistic", "hard", "chaos"),
         episode_len:  int = 1000,
         seeds:        Tuple[int, int] = (1000, 1_000_000),
+        calibration=None,
     ):
         super().__init__()
+        self.calibration  = calibration
         self.difficulties = tuple(difficulties)
         self.episode_len  = episode_len
         self.seed_range   = seeds
@@ -155,7 +157,8 @@ class GymClusterEnv(gym.Env):
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
         d  = self.difficulties[int(self.np_random.integers(len(self.difficulties)))]
-        sc = make_scenario(int(self.np_random.integers(*self.seed_range)), d, self.episode_len)
+        sc = make_scenario(int(self.np_random.integers(*self.seed_range)), d, self.episode_len,
+                           self.calibration)
         self._scenario = sc
         self._cluster  = sc.make_cluster()
         self._cluster.apply_checkpoint()
@@ -214,27 +217,28 @@ def load_policy(path: str = MODEL_PATH):
 # TRAIN / EVAL
 # =============================================================================
 
-_RULE_CACHE: Dict[Tuple[str, int], float] = {}
+_RULE_CACHE: Dict[Tuple[str, int, int], float] = {}
 
 
 def validation_score(make_policy, seeds: Sequence[int] = VALIDATION_SEEDS,
-                     difficulties: Sequence[str] = DIFFICULTIES) -> float:
+                     difficulties: Sequence[str] = DIFFICULTIES, calibration=None) -> float:
     """Mean goodput relative to the Reactive rule on validation scenarios (1.0 = tie)."""
     from simulator import ReactivePolicy, run_episode
     ratios = []
     for d in difficulties:
         for s in seeds:
-            sc = make_scenario(s, d)
-            if (d, s) not in _RULE_CACHE:
-                _RULE_CACHE[(d, s)] = run_episode(sc.make_cluster(), ReactivePolicy(),
-                                                  sc.schedule, 1000).goodput_per_hr
+            sc  = make_scenario(s, d, calibration=calibration)
+            key = (d, s, id(calibration))
+            if key not in _RULE_CACHE:
+                _RULE_CACHE[key] = run_episode(sc.make_cluster(), ReactivePolicy(),
+                                               sc.schedule, 1000).goodput_per_hr
             g = run_episode(sc.make_cluster(), make_policy(), sc.schedule, 1000).goodput_per_hr
-            ratios.append(g / _RULE_CACHE[(d, s)])
+            ratios.append(g / _RULE_CACHE[key])
     return float(np.mean(ratios))
 
 
 def train(total_steps: int, n_envs: int = 8, path: str = MODEL_PATH, seed: int = 0,
-          eval_every: int = 100_000) -> None:
+          eval_every: int = 100_000, calibration=None) -> None:
     """
     Train on all difficulty levels with a decaying learning rate. Every
     `eval_every` steps, score the model on validation scenarios and keep the best
@@ -253,7 +257,7 @@ def train(total_steps: int, n_envs: int = 8, path: str = MODEL_PATH, seed: int =
         def _on_step(self) -> bool:
             if self.num_timesteps >= self.next_eval:
                 self.next_eval += eval_every
-                score = validation_score(lambda: RLPolicy(self.model))
+                score = validation_score(lambda: RLPolicy(self.model), calibration=calibration)
                 tag = ""
                 if score > self.best:
                     self.best, tag = score, "  <- best, saved"
@@ -261,7 +265,7 @@ def train(total_steps: int, n_envs: int = 8, path: str = MODEL_PATH, seed: int =
                 print(f"  [val] {self.num_timesteps:>9d} steps: {score:.4f} x rule{tag}", flush=True)
             return True
 
-    venv  = DummyVecEnv([lambda: Monitor(GymClusterEnv(difficulties=DIFFICULTIES))
+    venv  = DummyVecEnv([lambda: Monitor(GymClusterEnv(difficulties=DIFFICULTIES, calibration=calibration))
                          for _ in range(n_envs)])
     venv.seed(seed)
     model = MaskablePPO(
@@ -294,11 +298,11 @@ def evaluate(path: str = MODEL_PATH, seeds: range = range(20)) -> None:
     policies = default_policies()
     if os.path.exists(BC_PATH):
         import pickle
-        from agent_brain import NORMAL_SPEEDS, ClusterDetector, HybridAgentPolicy, MPCFallback
+        from agent_brain import ClusterDetector, HybridAgentPolicy, MPCFallback
         with open(BC_PATH, "rb") as f:
             bc = pickle.load(f)
         policies["BC + DAgger hybrid"] = lambda sc: HybridAgentPolicy(
-            bc, MPCFallback(), ClusterDetector(NORMAL_SPEEDS))
+            bc, MPCFallback(), ClusterDetector(sc.normal_speeds))
     policies["RL agent (PPO)"] = load_policy(path)
     print_benchmark(benchmark(policies, DIFFICULTIES, seeds), len(seeds))
 
@@ -313,7 +317,7 @@ def paired_bootstrap_ci(a: Sequence[float], b: Sequence[float], n: int = 10000,
 
 
 def report(model_paths: Sequence[str], seeds: range = range(30),
-           out_dir: str = "results") -> None:
+           out_dir: str = "results", calibration=None) -> None:
     """
     Final comparison: every baseline, the BC hybrid, and each trained PPO model,
     on `seeds` unseen scenarios per difficulty. Writes results/results.json and
@@ -325,17 +329,17 @@ def report(model_paths: Sequence[str], seeds: range = range(30),
     policies = default_policies()
     if os.path.exists(BC_PATH):
         import pickle
-        from agent_brain import NORMAL_SPEEDS, ClusterDetector, HybridAgentPolicy, MPCFallback
+        from agent_brain import ClusterDetector, HybridAgentPolicy, MPCFallback
         with open(BC_PATH, "rb") as f:
             bc = pickle.load(f)
         policies["BC + DAgger hybrid"] = lambda sc: HybridAgentPolicy(
-            bc, MPCFallback(), ClusterDetector(NORMAL_SPEEDS))
+            bc, MPCFallback(), ClusterDetector(sc.normal_speeds))
     rl_names = []
     for i, path in enumerate(model_paths):
         rl_names.append(f"RL seed {i}")
         policies[rl_names[-1]] = load_policy(path)
 
-    res = benchmark(policies, DIFFICULTIES, seeds)
+    res = benchmark(policies, DIFFICULTIES, seeds, calibration=calibration)
     print_benchmark(res, len(seeds))
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "results.json"), "w") as f:
@@ -361,12 +365,18 @@ if __name__ == "__main__":
     ap.add_argument("--steps", type=int, default=1_000_000)
     ap.add_argument("--path", default=MODEL_PATH)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--calibration", help="calibration.json from calibration.py (measured laptops)")
+    ap.add_argument("--out", default="results")
     a = ap.parse_args()
+    cal = None
+    if a.calibration:
+        from calibration import Calibration
+        cal = Calibration.load(a.calibration)
     if a.mode == "train":
-        train(a.steps, path=a.path, seed=a.seed)
+        train(a.steps, path=a.path, seed=a.seed, calibration=cal)
     elif a.mode == "train-bc":
         train_bc()
     elif a.mode == "report":
-        report(a.models)
+        report(a.models, out_dir=a.out, calibration=cal)
     else:
         evaluate(a.path)

@@ -49,6 +49,43 @@ Goodput as % of the Oracle (an upper bound that knows the future):
   of per batch and only looked to the next fault. The Oracle now plans by
   **rollout**: copy the simulator, try each action 300 ticks into the known future.
 
+## Calibrating with real laptop numbers (`calibration.py`)
+
+`calibration.py` reads the [mlx_test](https://github.com/RajvanshMalhotra/mlx_test)
+results folder and sets the simulator's speeds (batches/s) and all-reduce time from
+measurements. Every number records whether it was measured or assumed
+(`calibration.json` → `sources`).
+
+Measured so far (Mac M2 8 GB, MLX 0.32.4, LoRA rank 8 on the last 16 blocks, 1 x 256 tokens):
+
+| Model (4-bit) | s per step | tokens/s | peak memory | LoRA params |
+|---|---|---|---|---|
+| Qwen2.5-0.5B | 0.29 | 874 | 1.3 GB | 2.9 M |
+| Qwen2.5-1.5B | 2.35 | 109 | 2.3 GB | 5.3 M |
+| Qwen2.5-3B | 3.0 first step, then 24-108 (swapping) | 4.2 | 3.3 GB | 6.7 M |
+
+The 3B model fits for one step, then macOS swaps (other apps open, swap 6-10 GB used),
+so we calibrate on 1.5B. **Not yet measured:** the NVIDIA laptops' speed and the
+Wi-Fi speed between laptops; those use the old assumptions (NVIDIA = 2.92 x Mac,
+5 MB/s, 5 ms).
+
+**What calibration showed.** The LoRA gradients are 20 MiB per all-reduce. On 5 MB/s
+Wi-Fi that costs 5.4 s per step, more than the Mac saves by joining, so with these
+numbers one NVIDIA laptop alone (6.4 s/batch) beats all three (8.1 s/batch). The
+three laptops win only with a link above ~7 MB/s or a global batch above ~3,000
+tokens. `python calibration.py <results>` prints a what-if table of the best set of
+laptops for each NVIDIA speed and Wi-Fi speed. The two numbers to measure next are
+exactly those: NVIDIA tokens/s (Test 1) and Wi-Fi MB/s (`net_bench.py` / Test 3).
+
+```bash
+python calibration.py ../spikes/mlx_feasibility/results          # writes calibration.json
+python rl_agent.py train --seed 0 --path models/cal_seed0.zip --calibration calibration.json
+python rl_agent.py report --models models/cal_seed*.zip --calibration calibration.json --out results/calibrated
+```
+
+Still assumptions after calibration: fault rates and durations, action overheads,
+memory caps (a stress setting per level), prices.
+
 ## Run
 
 ```bash
@@ -69,12 +106,14 @@ python rl_agent.py report --models models/v2_seed0.zip models/v2_seed1.zip model
 | `agent_brain.py` | Detector, MPC fallback, imitation model (BC + DAgger), hybrid agent with shortlist + shield |
 | `rl_agent.py` | Gymnasium env with action masks, MaskablePPO training (keeps the best checkpoint on validation scenarios), evaluation with bootstrap CIs |
 | `stress_test.py` | Fuzzing with invariants, policy benchmark |
+| `calibration.py` | Sets simulator speeds and all-reduce time from mlx_test measurements; does training together pay off? |
+| `calibration.json` | The current calibration, with the source of every number |
 | `models/` | The 3 trained RL models (v2) and the imitation model |
 | `test_*.py` | Tests, including one regression test per bug found |
 
 ## Limits (be honest in the report)
 
-- Everything is simulated. Speeds, costs and fault rates are estimates until we
-  measure the real laptops.
+- Everything is simulated. Only the Mac's training speed is measured so far
+  (`calibration.json`); NVIDIA speed, Wi-Fi speed, costs and fault rates are estimates.
 - The Oracle is a strong reference, not a proven optimum (in v1, one RL run beat it).
 - Validation seeds 500-505 pick the checkpoint; test seeds 0-29 are never used for training or selection.

@@ -458,7 +458,7 @@ class SimulatedCluster:
     ----------
     Each machine takes `m.share / m.measured_speed` simulated seconds to process its share;
     the step lasts as long as the slowest one, plus the all-reduce (comm_s). A crashed
-    machine still in the ring stalls every tick for STALL_TICK_S.
+    machine still in the ring stalls every tick for stall_tick_s (>= one healthy step).
     """
 
     HEARTBEAT_INTERVAL_S: float = HEARTBEAT_INTERVAL_S
@@ -473,6 +473,7 @@ class SimulatedCluster:
         spike_prob: float = 0.0,
         comm_s: float = 0.0,
         max_share: Optional[Dict[str, float]] = None,
+        normal_speeds: Optional[Dict[str, float]] = None,
     ):
         rng = random.Random(seed)
         self._obs_rng = random.Random(seed * 7919 + 1)   # measurement noise only
@@ -527,9 +528,15 @@ class SimulatedCluster:
             m.last_heartbeat = -rng.uniform(0, self.HEARTBEAT_INTERVAL_S)
             m.last_seen_speed = m.measured_speed
             m.max_share = (max_share or {}).get(m.machine_id, 1.0)
+            if normal_speeds and m.machine_id in normal_speeds:   # measured (calibration.py)
+                m.normal_speed = m.measured_speed = m.last_seen_speed = normal_speeds[m.machine_id]
 
         self._last_checkpoint_step: float = 0.0
         self._rebalance_shares()   # Distribute initial shares proportional to capacity
+        # A stalled tick lasts at least one healthy step. Episodes are a fixed number of
+        # ticks, so a stall shorter than a training step would make freezing the ring
+        # "cheaper" than training on (measured laptops take 3-8 s per step).
+        self.stall_tick_s: float = max(STALL_TICK_S, self.healthy_step_time())
 
     # Public helpers
 
@@ -699,9 +706,9 @@ class SimulatedCluster:
         # 2. A crashed machine still in the ring freezes the all-reduce barrier
         ring = [m for m in self._machines.values() if not m.evicted]
         if any(not m.alive for m in ring) or not any(m.is_active for m in ring):
-            self._advance(STALL_TICK_S)
-            self.stall_time_s += STALL_TICK_S
-            useful, duration = False, STALL_TICK_S
+            self._advance(self.stall_tick_s)
+            self.stall_time_s += self.stall_tick_s
+            useful, duration = False, self.stall_tick_s
         else:
             speeds   = {m.machine_id: m.measured_speed for m in ring}
             shares   = {m.machine_id: m.share for m in ring}

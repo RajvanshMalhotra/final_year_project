@@ -4,4 +4,5 @@ __pycache__/
 .pytest_cache/
 models/*
 !models/v2_seed*.zip
+!models/cal_seed*.zip
 !models/bc_hybrid.pkl

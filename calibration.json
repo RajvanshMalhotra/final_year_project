@@ -1,0 +1,22 @@
+{
+  "speeds": {
+    "mac-m2": 0.053173828125,
+    "win-gpu-0": 0.15509033203125003,
+    "win-gpu-1": 0.15509033203125003
+  },
+  "comm_s": 4.032500000000001,
+  "grad_mb": 20.125,
+  "global_batch_tokens": 2048,
+  "fits": {
+    "mac-m2": true,
+    "win-gpu-0": true,
+    "win-gpu-1": true
+  },
+  "sources": {
+    "speed:mac-m2": "measured: rajvanshs-macbook-pro/test1_train.json, 108.9 tokens/s (mlx-community/Qwen2.5-1.5B-Instruct-4bit)",
+    "speed:win-gpu-0": "assumed: 2.92 x the Mac (old simulator ratio)",
+    "speed:win-gpu-1": "assumed: 2.92 x the Mac (old simulator ratio)",
+    "comm_s": "assumed: Wi-Fi 5.0 MB/s, 5.0 ms round trip",
+    "grad_mb": "measured: 5275648 trainable LoRA params x 4 bytes"
+  }
+}

@@ -23,7 +23,7 @@ import numpy as np
 
 from scenarios import DIFFICULTIES, Scenario, make_scenario
 from simulator import (
-    STALL_TICK_S, Action, AlwaysRestartPolicy, BasePolicy, DoNothingPolicy, OraclePolicy,
+    Action, AlwaysRestartPolicy, BasePolicy, DoNothingPolicy, OraclePolicy,
     ReactivePolicy, RebalanceOnlyPolicy, SimulatedCluster, TimeDelayedPolicy, plan_action, run_episode,
 )
 
@@ -91,7 +91,7 @@ def fuzz(n_episodes: int = 30, difficulty: str = "chaos", ticks: int = 400,
                 violations.append(f"ep {ep} tick {t}: {action.name}({target}) raised {e!r}")
                 break
             if target != "no-such-machine" and action != Action.CHECKPOINT:
-                expect = predicted if math.isfinite(predicted) else STALL_TICK_S
+                expect = predicted if math.isfinite(predicted) else c.stall_tick_s
                 if abs(expect - duration) > 1e-9 or abs(overhead - info["overhead_s"]) > 1e-9:
                     violations.append(
                         f"ep {ep} tick {t}: plan said ({overhead:.3f}, {expect:.4f}) for "
@@ -108,7 +108,7 @@ PolicyFactory = Callable[[Scenario], BasePolicy]
 
 
 def default_policies() -> Dict[str, PolicyFactory]:
-    from agent_brain import ClusterDetector, DecisionModel, HybridAgentPolicy, MPCFallback, NORMAL_SPEEDS
+    from agent_brain import ClusterDetector, DecisionModel, HybridAgentPolicy, MPCFallback
     return {
         "Do nothing":        lambda sc: DoNothingPolicy(),
         "Restart on crash":  lambda sc: AlwaysRestartPolicy(),
@@ -117,7 +117,7 @@ def default_policies() -> Dict[str, PolicyFactory]:
         "Wait 10, then act": lambda sc: TimeDelayedPolicy(10),
         "Wait 60, then act": lambda sc: TimeDelayedPolicy(60),
         "MPC only":          lambda sc: HybridAgentPolicy(DecisionModel(), MPCFallback(),
-                                                          ClusterDetector(NORMAL_SPEEDS)),
+                                                          ClusterDetector(sc.normal_speeds)),
     }
 
 
@@ -126,13 +126,15 @@ def benchmark(
     difficulties: Tuple[str, ...] = DIFFICULTIES,
     seeds:        range = range(20),
     total_steps:  int = 1000,
+    calibration=None,
 ) -> Dict[str, Dict[str, Dict[str, float]]]:
-    """result[difficulty][policy] = {mean_pct, worst_pct, below80, goodput, ms}"""
+    """result[difficulty][policy] = {mean_pct, worst_pct, below80, goodput, ms}.
+    calibration: run on measured laptop numbers (calibration.Calibration) instead of estimates."""
     out: Dict[str, Dict[str, Dict[str, float]]] = {}
     for d in difficulties:
         oracle = {}
         for s in seeds:
-            sc = make_scenario(s, d, total_steps)
+            sc = make_scenario(s, d, total_steps, calibration)
             oracle[s] = run_episode(sc.make_cluster(), OraclePolicy(sc.schedule),
                                     sc.schedule, total_steps).goodput_per_hr
         out[d] = {"Oracle": {"mean_pct": 100.0, "worst_pct": 100.0, "below80": 0,
@@ -140,7 +142,7 @@ def benchmark(
         for name, make in policies.items():
             pct, gput, ms = [], [], []
             for s in seeds:
-                sc = make_scenario(s, d, total_steps)
+                sc = make_scenario(s, d, total_steps, calibration)
                 r  = run_episode(sc.make_cluster(), make(sc), sc.schedule, total_steps)
                 pct.append(100.0 * r.goodput_per_hr / oracle[s] if oracle[s] > 0 else 0.0)
                 gput.append(r.goodput_per_hr)
