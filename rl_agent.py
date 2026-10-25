@@ -145,7 +145,7 @@ class GymClusterEnv(gym.Env):
         self.difficulties = tuple(difficulties)
         self.episode_len  = episode_len
         self.seed_range   = seeds
-        self.observation_space = gym.spaces.Box(-np.inf, np.inf, (RLFeatures.SIZE,), np.float32)
+        self.observation_space = gym.spaces.Box(0.0, 10.0, (RLFeatures.SIZE,), np.float32)
         self.action_space      = gym.spaces.Discrete(len(ACTIONS))
         self._features = RLFeatures()
         self._cluster  = None
@@ -215,9 +215,10 @@ def load_policy(path: str = MODEL_PATH):
 
 def train(total_steps: int, n_envs: int = 8, path: str = MODEL_PATH, seed: int = 0) -> None:
     from sb3_contrib import MaskablePPO
+    from stable_baselines3.common.monitor import Monitor
     from stable_baselines3.common.vec_env import DummyVecEnv
 
-    venv  = DummyVecEnv([lambda: GymClusterEnv() for _ in range(n_envs)])
+    venv  = DummyVecEnv([lambda: Monitor(GymClusterEnv()) for _ in range(n_envs)])
     venv.seed(seed)
     model = MaskablePPO(
         "MlpPolicy", venv, n_steps=1024, batch_size=512, n_epochs=10, gamma=0.995,
@@ -258,15 +259,70 @@ def evaluate(path: str = MODEL_PATH, seeds: range = range(20)) -> None:
     print_benchmark(benchmark(policies, DIFFICULTIES, seeds), len(seeds))
 
 
+def paired_bootstrap_ci(a: Sequence[float], b: Sequence[float], n: int = 10000,
+                        seed: int = 0) -> Tuple[float, float, float]:
+    """Mean of a-b over paired scenarios, with a 95% bootstrap confidence interval."""
+    d = np.asarray(a) - np.asarray(b)
+    rng = np.random.default_rng(seed)
+    means = rng.choice(d, size=(n, len(d)), replace=True).mean(axis=1)
+    return float(d.mean()), float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))
+
+
+def report(model_paths: Sequence[str], seeds: range = range(30),
+           out_dir: str = "results") -> None:
+    """
+    Final comparison: every baseline, the BC hybrid, and each trained PPO model,
+    on `seeds` unseen scenarios per difficulty. Writes results/results.json and
+    prints RL mean +/- spread over training seeds, plus a paired bootstrap CI of
+    (RL - best simple rule) per level.
+    """
+    import json
+    from stress_test import benchmark, default_policies, print_benchmark
+    policies = default_policies()
+    if os.path.exists(BC_PATH):
+        import pickle
+        from agent_brain import NORMAL_SPEEDS, ClusterDetector, HybridAgentPolicy, MPCFallback
+        with open(BC_PATH, "rb") as f:
+            bc = pickle.load(f)
+        policies["BC + DAgger hybrid"] = lambda sc: HybridAgentPolicy(
+            bc, MPCFallback(), ClusterDetector(NORMAL_SPEEDS))
+    rl_names = []
+    for i, path in enumerate(model_paths):
+        rl_names.append(f"RL seed {i}")
+        policies[rl_names[-1]] = load_policy(path)
+
+    res = benchmark(policies, DIFFICULTIES, seeds)
+    print_benchmark(res, len(seeds))
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "results.json"), "w") as f:
+        json.dump(res, f, indent=1)
+
+    print("\n  RL over training seeds, and paired 95% CI of (RL - best simple rule), % of Oracle")
+    for d, rows in res.items():
+        rl_means = [rows[n]["mean_pct"] for n in rl_names]
+        rl_worst = [rows[n]["worst_pct"] for n in rl_names]
+        rules = [n for n in rows if n not in rl_names + ["Oracle", "BC + DAgger hybrid"]]
+        best_rule = max(rules, key=lambda n: rows[n]["mean_pct"])
+        rl_avg = np.mean([rows[n]["pcts"] for n in rl_names], axis=0)
+        diff, lo, hi = paired_bootstrap_ci(rl_avg, rows[best_rule]["pcts"])
+        print(f"  [{d:<9}] RL {np.mean(rl_means):5.1f} (seeds {min(rl_means):.1f}-{max(rl_means):.1f}), "
+              f"worst ep {min(rl_worst):5.1f} | best rule {best_rule}: {rows[best_rule]['mean_pct']:5.1f} "
+              f"| RL - rule = {diff:+.1f} [{lo:+.1f}, {hi:+.1f}]")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["train", "train-bc", "eval"])
+    ap.add_argument("mode", choices=["train", "train-bc", "eval", "report"])
+    ap.add_argument("--models", nargs="*", default=[MODEL_PATH])
     ap.add_argument("--steps", type=int, default=1_000_000)
     ap.add_argument("--path", default=MODEL_PATH)
+    ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     if a.mode == "train":
-        train(a.steps, path=a.path)
+        train(a.steps, path=a.path, seed=a.seed)
     elif a.mode == "train-bc":
         train_bc()
+    elif a.mode == "report":
+        report(a.models)
     else:
         evaluate(a.path)

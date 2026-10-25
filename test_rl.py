@@ -95,3 +95,17 @@ class TestFeatures(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestStats(unittest.TestCase):
+
+    def test_bootstrap_ci_contains_true_difference(self):
+        from rl_agent import paired_bootstrap_ci
+        rng = np.random.default_rng(1)
+        b = rng.normal(90, 5, 200)
+        a = b + 2 + rng.normal(0, 1, 200)
+        mean, lo, hi = paired_bootstrap_ci(a, b)
+        self.assertAlmostEqual(mean, 2, delta=0.3)
+        self.assertLess(lo, 2)
+        self.assertGreater(hi, 2)
+        self.assertGreater(lo, 0)

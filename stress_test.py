@@ -147,7 +147,8 @@ def benchmark(
                 ms.append(r.avg_decision_ms)
             out[d][name] = {"mean_pct": float(np.mean(pct)), "worst_pct": float(np.min(pct)),
                             "below80": int(np.sum(np.array(pct) < 80)),
-                            "goodput": float(np.mean(gput)), "ms": float(np.mean(ms))}
+                            "goodput": float(np.mean(gput)), "ms": float(np.mean(ms)),
+                            "pcts": pct}
     return out
 
 
