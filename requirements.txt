@@ -2,3 +2,6 @@ numpy
 scikit-learn>=1.6
 matplotlib
 pytest
+gymnasium
+stable-baselines3
+sb3-contrib
