@@ -64,7 +64,8 @@ from simulator import (
     CRASH_SIGNAL_AGE_S, SLOW_RATIO_THRESHOLD,
     Action, BasePolicy, DoNothingPolicy, MachineObs, Observation, OraclePolicy,
     PolicyOutput, RandomFaultGenerator, RebalanceOnlyPolicy, SimulatedCluster,
-    TimeDelayedPolicy, _unpack, is_readmittable, plan_action, proportional_shares,
+    TimeDelayedPolicy, _unpack, is_readmittable, plan_action, plan_action_full,
+    proportional_shares, seconds_per_batch,
     run_episode, speed_ratio, step_time,
 )
 
@@ -373,10 +374,11 @@ class MPCFallback:
     @staticmethod
     def _project(action: Action, target: Optional[str], obs: Observation, horizon: int) -> float:
         """Goodput (steps/hour) over `horizon` steps if we take `action` now."""
-        overhead, st = plan_action(obs, action, target)
-        if not math.isfinite(st):
+        overhead, st, prog = plan_action_full(obs, action, target)
+        spb = seconds_per_batch(st, prog)
+        if not math.isfinite(spb):
             return 0.0
-        return horizon / (overhead + horizon * st) * 3600.0
+        return horizon / (overhead + horizon * spb) * 3600.0
 
     @staticmethod
     def diagnose(detections: List[FaultDetection],

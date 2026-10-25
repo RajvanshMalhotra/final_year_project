@@ -246,3 +246,31 @@ class TestScenarios(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestBreakFindings(unittest.TestCase):
+    """Bugs found by stress_test.py on 2026-10-25."""
+
+    # The planner ignored that a capped machine alone does only part of a batch per step.
+    def test_planner_reports_progress_per_step(self):
+        from simulator import plan_action_full
+        c = SimulatedCluster(seed=0, max_share={"mac-m2": 0.3})
+        c.apply_action(Action.EVICT, "win-gpu-1")
+        _, _, progress = plan_action_full(c.get_observation().truth, Action.EVICT, "win-gpu-0")
+        self.assertAlmostEqual(progress, 0.3)
+
+    # So the Oracle evicted healthy GPUs down to a lone capped Mac and lost to simple rules.
+    def test_oracle_is_upper_bound_on_harder_levels(self):
+        from simulator import TimeDelayedPolicy, RebalanceOnlyPolicy
+        for d in ("realistic", "hard"):
+            for s in range(8):
+                sc = make_scenario(s, d)
+                best = run_episode(sc.make_cluster(), OraclePolicy(sc.schedule), sc.schedule, 1000)
+                for p in (RebalanceOnlyPolicy(), TimeDelayedPolicy(10)):
+                    other = run_episode(sc.make_cluster(), p, sc.schedule, 1000)
+                    self.assertGreaterEqual(best.goodput_per_hr, other.goodput_per_hr * 0.99,
+                                            f"{d} seed {s}: Oracle lost to {p.name}")
+
+    def test_fuzzing_finds_no_violations(self):
+        from stress_test import fuzz
+        self.assertEqual(fuzz(n_episodes=30, difficulty="chaos", ticks=400), [])

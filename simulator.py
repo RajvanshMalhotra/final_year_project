@@ -39,6 +39,7 @@ All other code uses only the Python standard library.
 
 from __future__ import annotations
 
+import copy
 import math
 import os
 import random
@@ -286,6 +287,24 @@ def plan_action(
     alone, using the same rules as SimulatedCluster.apply_action. step_time is
     math.inf when the ring would still be stalled by a dead machine.
     """
+    overhead, st, _ = plan_action_full(obs, action, target)
+    return overhead, st
+
+
+def seconds_per_batch(step_s: float, progress: float) -> float:
+    """What planners should minimise: a step that does only part of a batch is slower."""
+    return step_s / progress if progress > 0 and math.isfinite(step_s) else math.inf
+
+
+def plan_action_full(
+    obs: Observation,
+    action: Action,
+    target: Optional[str] = None,
+) -> Tuple[float, float, float]:
+    """
+    plan_action plus progress per step (sum of shares: < 1 when memory caps bind,
+    0 when stalled). Planners must compare seconds_per_batch, not step time.
+    """
     if target is None:
         target = default_target(obs, action)
     machines = obs.machines
@@ -322,7 +341,8 @@ def plan_action(
 
     elif action == Action.READMIT:
         m = machines.get(target) if target else None
-        if m is not None and m.evicted and m.alive_signal_age <= CRASH_SIGNAL_AGE_S:
+        if (m is not None and m.evicted and m.alive_signal_age <= CRASH_SIGNAL_AGE_S
+                and m.measured_speed > DEAD_SPEED_THRESHOLD):
             speeds[target] = m.measured_speed
             shares, overhead = resplit(), ACTION_OVERHEAD_S[action]
 
@@ -334,8 +354,9 @@ def plan_action(
         overhead = ACTION_OVERHEAD_S[action]
 
     if dead:
-        return overhead, math.inf
-    return overhead, step_time(speeds, shares, bw, obs.comm_s)
+        return overhead, math.inf, 0.0
+    st = step_time(speeds, shares, bw, obs.comm_s)
+    return overhead, st, (sum(shares.values()) if math.isfinite(st) else 0.0)
 
 
 def _unpack(output: PolicyOutput) -> Tuple[Action, Optional[str]]:
@@ -826,7 +847,10 @@ class SimulatedCluster:
         old    = {mid: m.share for mid, m in self._machines.items()}
         for mid, m in self._machines.items():
             m.share = new.get(mid, 0.0)
-        return _shares_differ(old, {mid: m.share for mid, m in self._machines.items()})
+        # Zeroing a crashed machine's share moves no data, so it is not a change.
+        alive = [mid for mid, m in self._machines.items() if m.alive]
+        return _shares_differ({k: old[k] for k in alive},
+                              {k: self._machines[k].share for k in alive})
 
 
 
@@ -908,6 +932,8 @@ def run_episode(
     # Issue an initial checkpoint so RESTART has a valid rollback point.
     cluster.apply_checkpoint()
     cluster.fire_due_faults(fault_schedule)
+    if hasattr(policy, "bind"):
+        policy.bind(cluster, fault_schedule, total_steps)   # Oracle only: perfect information
 
     for _ in range(total_steps):
         obs = cluster.get_observation()
@@ -1046,8 +1072,36 @@ class OraclePolicy(BasePolicy):
 
     HORIZON: int = 300    # cap on how far ahead one decision has to pay off
 
+    # Rollout mode (when run_episode binds the real cluster)
+    ROLLOUT_HORIZON: int = 300   # ticks each candidate is played into the known future
+    REPLAN_EVERY:    int = 25    # also re-plan this often when nothing changes
+
     def __init__(self, fault_generator: object):
         self._gen = fault_generator
+        self._cluster:  Optional["SimulatedCluster"] = None
+        self._schedule: Optional[FaultSchedule] = None
+        self._total_steps: int = 0
+        self._last_plan: int = -10 ** 9
+        self._acted_last: bool = False
+
+    def bind(self, cluster: "SimulatedCluster", schedule: FaultSchedule, total_steps: int) -> None:
+        """
+        Give the Oracle the real cluster. It then plans by ROLLOUT: copy the
+        simulator, try each useful action, play ROLLOUT_HORIZON ticks of the known
+        future with each of two greedy follow-up policies (with and without
+        readmitting recovered machines), keep the action whose best follow-up
+        scores highest. Every rollout is a plan that could really be executed, so
+        the Oracle is a fair upper bound. It sees past the next fault, which the
+        regime rule below cannot.
+        """
+        self._cluster, self._schedule, self._total_steps = cluster, schedule, total_steps
+        self._change_ticks = set()
+        for e in self.events:
+            self._change_ticks.add(e.step)
+            if e.duration_steps:
+                self._change_ticks.add(e.step + e.duration_steps)
+            if e.ramp_steps:
+                self._change_ticks.add(e.step + e.ramp_steps)
 
     @property
     def events(self) -> List[FaultEvent]:
@@ -1082,6 +1136,48 @@ class OraclePolicy(BasePolicy):
         return down
 
     def decide(self, observation: Observation) -> PolicyOutput:
+        if self._cluster is not None:
+            return self._decide_rollout(observation)
+        return self._decide_regime(observation)
+
+    # ---- rollout planner (bound) -------------------------------------------
+
+    def _decide_rollout(self, observation: Observation) -> PolicyOutput:
+        tick = observation.step
+        if not (self._acted_last or tick in self._change_ticks
+                or tick - self._last_plan >= self.REPLAN_EVERY):
+            return Action.WAIT
+        self._last_plan = tick
+
+        obs = observation.truth or observation
+        candidates: List[Tuple[Action, Optional[str]]] = [(Action.WAIT, None)]
+        for action, target in [(Action.REBALANCE, None)] + [
+                (a, mid) for mid in obs.machines
+                for a in (Action.COMPENSATE, Action.EVICT, Action.READMIT)]:
+            overhead, _ = plan_action(obs, action, target)
+            if overhead > 0:                       # only actions that change something
+                candidates.append((action, target))
+
+        horizon = max(1, min(self.ROLLOUT_HORIZON, self._total_steps - tick))
+        rate = 1.0 / self._cluster.healthy_step_time()
+        best, best_score = (Action.WAIT, None), -math.inf
+        for action, target in candidates:
+            for readmit in (True, False):
+                sim = copy.deepcopy(self._cluster)
+                p0, t0 = sim.train_step, sim.sim_time
+                sim.apply_action(action, target)
+                for _ in range(horizon):
+                    sim.step_forward(self._schedule)
+                    _greedy_step(sim, readmit)
+                score = (sim.train_step - p0) - rate * (sim.sim_time - t0)
+                if score > best_score + 1e-9:
+                    best, best_score = (action, target), score
+        self._acted_last = best[0] != Action.WAIT
+        return best if best[0] != Action.WAIT else Action.WAIT
+
+    # ---- regime planner (unbound: observation + schedule only) ---------------
+
+    def _decide_regime(self, observation: Observation) -> PolicyOutput:
         tick = observation.step
         obs  = observation.truth or observation
         machines = obs.machines
@@ -1092,11 +1188,13 @@ class OraclePolicy(BasePolicy):
                 continue
             if back_in is None:
                 return (Action.EVICT, mid)
-            _, st_without = plan_action(obs, Action.EVICT, mid)
+            _, st, prog = plan_action_full(obs, Action.EVICT, mid)
+            st_without = seconds_per_batch(st, prog)
             restored = dict(machines)
             restored[mid] = replace(machines[mid], measured_speed=machines[mid].normal_speed,
                                     alive_signal_age=0.0)
-            _, st_back = plan_action(replace(obs, machines=restored), Action.WAIT)
+            _, st, prog = plan_action_full(replace(obs, machines=restored), Action.WAIT)
+            st_back = seconds_per_batch(st, prog)
             wait_cost  = back_in * (STALL_TICK_S + st_back) + ACTION_OVERHEAD_S[Action.READMIT]
             evict_cost = (ACTION_OVERHEAD_S[Action.EVICT] + back_in * st_without
                           + ACTION_OVERHEAD_S[Action.READMIT])
@@ -1113,11 +1211,30 @@ class OraclePolicy(BasePolicy):
 
         best, best_cost = (Action.WAIT, None), math.inf
         for action, target in candidates:
-            overhead, st = plan_action(obs, action, target)
-            cost = overhead + R * st
+            overhead, st, prog = plan_action_full(obs, action, target)
+            cost = overhead + R * seconds_per_batch(st, prog)
             if cost < best_cost - 1e-9:
                 best, best_cost = (action, target), cost
         return best
+
+
+def _greedy_step(c: "SimulatedCluster", readmit: bool = True) -> None:
+    """
+    Rollout base policy, acting directly on the true cluster state (fast):
+    evict crashed machines, readmit recovered ones (optional), re-split when
+    shares are off.
+    """
+    for mid, m in c.machines.items():
+        if not m.evicted and not m.alive:
+            c.apply_action(Action.EVICT, mid)
+        elif (readmit and m.evicted and m.alive
+              and m.measured_speed >= SLOW_RATIO_THRESHOLD * m.normal_speed):
+            c.apply_action(Action.READMIT, mid)
+    active = {mid: m.measured_speed for mid, m in c.machines.items() if m.is_active}
+    caps   = {mid: m.max_share for mid, m in c.machines.items()}
+    ideal  = proportional_shares(active, caps)
+    if _shares_differ(ideal, {mid: c.machines[mid].share for mid in active}, SHARE_TOLERANCE):
+        c.apply_action(Action.REBALANCE)
 
 
 class TimeDelayedPolicy(BasePolicy):
