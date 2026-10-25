@@ -1,0 +1,11 @@
+  [val]    100000 steps: 1.7039 x rule  <- best, saved
+  [val]    200000 steps: 1.3286 x rule
+  [val]    300000 steps: 1.8538 x rule  <- best, saved
+  [val]    400000 steps: 1.8977 x rule  <- best, saved
+  [val]    500000 steps: 1.9494 x rule  <- best, saved
+  [val]    600000 steps: 1.9525 x rule  <- best, saved
+  [val]    700000 steps: 1.9335 x rule
+  [val]    800000 steps: 1.9279 x rule
+  [val]    900000 steps: 1.9111 x rule
+  [val]   1000000 steps: 1.9639 x rule  <- best, saved
+done: best checkpoint in models/cal_seed1.zip, 1000000 steps in 158s

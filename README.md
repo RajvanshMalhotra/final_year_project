@@ -77,6 +77,26 @@ tokens. `python calibration.py <results>` prints a what-if table of the best set
 laptops for each NVIDIA speed and Wi-Fi speed. The two numbers to measure next are
 exactly those: NVIDIA tokens/s (Test 1) and Wi-Fi MB/s (`net_bench.py` / Test 3).
 
+**Results on the calibrated simulator** (30 test scenarios per level, % of Oracle;
+`results/calibrated/`):
+
+| Level | Best simple rule | MPC only | RL v2 (trained on old speeds) | RL retrained on calibration |
+|---|---|---|---|---|
+| Easy | 98.6 | 97.3 | 98.8 | **53.7** (does not evict dead machines) |
+| Realistic | 75.5 | 94.7 | 60.5 | **98.0** (+3.3 [+1.5, +5.2] vs MPC) |
+| Hard | 55.6 | 90.4 | 47.5 | **96.8** (+6.4 [+1.9, +10.6] vs MPC) |
+| Chaos | 40.3 | 111.9 | 19.9 | 107.0 (-4.9 [-9.9, -0.8] vs MPC) |
+
+- Simple rules collapse once communication is expensive: they never shrink the ring.
+  Policies that plan ahead (MPC, Oracle, RL) learn to drop the Mac.
+- The v2 RL agent does not transfer to the calibrated speeds; retraining fixes
+  realistic and hard but breaks easy (no network cost there). Known causes: the
+  communication feature is in absolute units (0 on easy, 40-110 elsewhere) and the
+  keep-best score averages over levels, hiding one level's collapse. Fix after the
+  NVIDIA and Wi-Fi numbers are in, since they change the calibration anyway.
+- In chaos, MPC and RL beat the Oracle: its greedy follow-up plans are not optimal
+  when shrinking the ring pays, so "% of Oracle" is a yardstick, not a ceiling.
+
 ```bash
 python calibration.py ../spikes/mlx_feasibility/results          # writes calibration.json
 python rl_agent.py train --seed 0 --path models/cal_seed0.zip --calibration calibration.json
