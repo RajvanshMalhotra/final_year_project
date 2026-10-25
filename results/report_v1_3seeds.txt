@@ -1,0 +1,66 @@
+
+  [easy]  30 scenarios, goodput as % of the Oracle
+  Policy                   mean %  worst %  <80% eps  goodput/hr      ms
+  Oracle                    100.0    100.0         0       20267   0.000
+  Act at once                97.9     95.3         0       19840   0.003
+  Reactive (+readmit)        97.9     95.3         0       19840   0.003
+  MPC only                   97.5     93.0         0       19760   0.012
+  BC + DAgger hybrid         97.4     93.0         0       19751   0.451
+  Wait 10, then act          97.2     94.7         0       19708   0.003
+  RL seed 0                  96.2     79.2         1       19530   0.166
+  Wait 60, then act          95.0     90.2         0       19256   0.003
+  RL seed 2                  84.2     73.5         8       17175   0.162
+  RL seed 1                  77.4     63.8        25       15713   0.161
+  Restart on crash           75.5     64.0        24       15268   0.001
+  Do nothing                 10.2      3.6        30        2126   0.000
+
+  [realistic]  30 scenarios, goodput as % of the Oracle
+  Policy                   mean %  worst %  <80% eps  goodput/hr      ms
+  Oracle                    100.0    100.0         0       16442   0.000
+  RL seed 0                  96.6     89.7         0       15899   0.171
+  RL seed 1                  95.4     81.3         0       15718   0.168
+  Reactive (+readmit)        95.3     70.5         1       15681   0.003
+  RL seed 2                  94.2     53.1         1       15588   0.166
+  BC + DAgger hybrid         91.7     81.9         0       15045   0.430
+  Wait 10, then act          91.3     57.2         6       15056   0.003
+  MPC only                   90.9     76.6         2       14920   0.013
+  Act at once                90.1     57.3         6       14854   0.003
+  Wait 60, then act          89.4     57.4         6       14741   0.003
+  Restart on crash           70.2     45.3        26       11621   0.001
+  Do nothing                 36.6      1.0        28        6394   0.000
+
+  [hard]  30 scenarios, goodput as % of the Oracle
+  Policy                   mean %  worst %  <80% eps  goodput/hr      ms
+  Oracle                    100.0    100.0         0       12591   0.000
+  RL seed 0                  95.3     83.0         0       11923   0.170
+  RL seed 2                  92.9     52.3         1       11669   0.165
+  Reactive (+readmit)        92.9     77.4         1       11562   0.003
+  RL seed 1                  92.6     67.9         3       11606   0.167
+  Wait 10, then act          89.0     41.3         5       11112   0.003
+  Wait 60, then act          87.9     41.3         5       10966   0.003
+  Act at once                86.8     41.2         5       10808   0.003
+  MPC only                   83.5     55.0         9       10402   0.014
+  BC + DAgger hybrid         83.5     29.5         7       10407   0.440
+  Restart on crash           68.5     25.4        25        8554   0.001
+  Do nothing                 27.1      1.6        30        3623   0.000
+
+  [chaos]  30 scenarios, goodput as % of the Oracle
+  Policy                   mean %  worst %  <80% eps  goodput/hr      ms
+  RL seed 0                 100.4     80.1         0        9527   0.172
+  Oracle                    100.0    100.0         0        9651   0.000
+  RL seed 2                  88.7     51.4         7        8619   0.162
+  RL seed 1                  86.4     46.9         8        8361   0.160
+  BC + DAgger hybrid         83.5     56.6        14        7902   0.438
+  Reactive (+readmit)        83.3     50.1        11        7881   0.003
+  MPC only                   82.8     55.9        14        7815   0.013
+  Wait 10, then act          46.2      6.3        26        4547   0.002
+  Wait 60, then act          46.0      6.3        26        4518   0.002
+  Act at once                45.5      6.4        27        4482   0.002
+  Restart on crash           33.1      3.7        29        3315   0.001
+  Do nothing                 25.1      2.8        30        2411   0.000
+
+  RL over training seeds, and paired 95% CI of (RL - best simple rule), % of Oracle
+  [easy     ] RL  86.0 (seeds 77.4-96.2), worst ep  63.8 | best rule Act at once:  97.9 | RL - rule = -12.0 [-13.0, -10.9]
+  [realistic] RL  95.4 (seeds 94.2-96.6), worst ep  53.1 | best rule Reactive (+readmit):  95.3 | RL - rule = +0.1 [-2.2, +2.8]
+  [hard     ] RL  93.6 (seeds 92.6-95.3), worst ep  52.3 | best rule Reactive (+readmit):  92.9 | RL - rule = +0.8 [-2.2, +3.8]
+  [chaos    ] RL  91.8 (seeds 86.4-100.4), worst ep  46.9 | best rule Reactive (+readmit):  83.3 | RL - rule = +8.5 [+3.3, +13.7]

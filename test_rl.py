@@ -109,3 +109,15 @@ class TestStats(unittest.TestCase):
         self.assertLess(lo, 2)
         self.assertGreater(hi, 2)
         self.assertGreater(lo, 0)
+
+
+class TestValidation(unittest.TestCase):
+
+    def test_validation_seeds_never_overlap_test_seeds(self):
+        from rl_agent import VALIDATION_SEEDS
+        self.assertTrue(set(VALIDATION_SEEDS).isdisjoint(range(100)))
+
+    def test_rule_scores_one_against_itself(self):
+        from rl_agent import validation_score
+        from simulator import ReactivePolicy
+        self.assertAlmostEqual(validation_score(lambda: ReactivePolicy(), seeds=range(500, 502)), 1.0)

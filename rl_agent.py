@@ -44,6 +44,7 @@ ACTIONS: List[Tuple[Action, Optional[str]]] = (
     + [(a, mid) for a in (Action.COMPENSATE, Action.EVICT, Action.READMIT) for mid in MACHINES]
 )
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "ppo_cluster.zip")
+VALIDATION_SEEDS = range(500, 506)   # model selection only; tests/reports use seeds 0-99
 BC_PATH    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "bc_hybrid.pkl")
 
 
@@ -213,23 +214,66 @@ def load_policy(path: str = MODEL_PATH):
 # TRAIN / EVAL
 # =============================================================================
 
-def train(total_steps: int, n_envs: int = 8, path: str = MODEL_PATH, seed: int = 0) -> None:
+_RULE_CACHE: Dict[Tuple[str, int], float] = {}
+
+
+def validation_score(make_policy, seeds: Sequence[int] = VALIDATION_SEEDS,
+                     difficulties: Sequence[str] = DIFFICULTIES) -> float:
+    """Mean goodput relative to the Reactive rule on validation scenarios (1.0 = tie)."""
+    from simulator import ReactivePolicy, run_episode
+    ratios = []
+    for d in difficulties:
+        for s in seeds:
+            sc = make_scenario(s, d)
+            if (d, s) not in _RULE_CACHE:
+                _RULE_CACHE[(d, s)] = run_episode(sc.make_cluster(), ReactivePolicy(),
+                                                  sc.schedule, 1000).goodput_per_hr
+            g = run_episode(sc.make_cluster(), make_policy(), sc.schedule, 1000).goodput_per_hr
+            ratios.append(g / _RULE_CACHE[(d, s)])
+    return float(np.mean(ratios))
+
+
+def train(total_steps: int, n_envs: int = 8, path: str = MODEL_PATH, seed: int = 0,
+          eval_every: int = 100_000) -> None:
+    """
+    Train on all difficulty levels with a decaying learning rate. Every
+    `eval_every` steps, score the model on validation scenarios and keep the best
+    checkpoint (PPO often gets worse late in training; this guards against it).
+    """
     from sb3_contrib import MaskablePPO
+    from stable_baselines3.common.callbacks import BaseCallback
     from stable_baselines3.common.monitor import Monitor
     from stable_baselines3.common.vec_env import DummyVecEnv
 
-    venv  = DummyVecEnv([lambda: Monitor(GymClusterEnv()) for _ in range(n_envs)])
+    class KeepBest(BaseCallback):
+        def __init__(self) -> None:
+            super().__init__()
+            self.best, self.next_eval = -math.inf, eval_every
+
+        def _on_step(self) -> bool:
+            if self.num_timesteps >= self.next_eval:
+                self.next_eval += eval_every
+                score = validation_score(lambda: RLPolicy(self.model))
+                tag = ""
+                if score > self.best:
+                    self.best, tag = score, "  <- best, saved"
+                    self.model.save(path)
+                print(f"  [val] {self.num_timesteps:>9d} steps: {score:.4f} x rule{tag}", flush=True)
+            return True
+
+    venv  = DummyVecEnv([lambda: Monitor(GymClusterEnv(difficulties=DIFFICULTIES))
+                         for _ in range(n_envs)])
     venv.seed(seed)
     model = MaskablePPO(
         "MlpPolicy", venv, n_steps=1024, batch_size=512, n_epochs=10, gamma=0.995,
-        gae_lambda=0.95, learning_rate=3e-4, ent_coef=0.01, clip_range=0.2,
-        policy_kwargs=dict(net_arch=[128, 128]), seed=seed, device="cpu", verbose=1,
+        gae_lambda=0.95, learning_rate=lambda progress: 3e-4 * progress, ent_coef=0.01,
+        clip_range=0.2, policy_kwargs=dict(net_arch=[128, 128]), seed=seed, device="cpu",
+        verbose=0,
     )
-    t0 = time.time()
-    model.learn(total_timesteps=total_steps)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    model.save(path)
-    print(f"saved {path} after {total_steps} steps in {time.time() - t0:.0f}s")
+    t0 = time.time()
+    model.learn(total_timesteps=total_steps, callback=KeepBest())
+    print(f"done: best checkpoint in {path}, {total_steps} steps in {time.time() - t0:.0f}s")
 
 
 def train_bc(path: str = BC_PATH, n_seeds: int = 12) -> None:

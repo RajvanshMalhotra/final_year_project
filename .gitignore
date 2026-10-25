@@ -2,5 +2,6 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-models/
-results/*.txt
+models/*
+!models/v2_seed*.zip
+!models/bc_hybrid.pkl
