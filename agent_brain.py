@@ -6,21 +6,23 @@ Self-Healing Mixed-GPU Training - Task C: Agent Brain
 Days 1-7 implementation:
 
   Day 1-2 : MachineDetector  +  evaluate_detector()
-  Day 3   : MPCFallback
-  Day 4   : DecisionModel    +  train_behavioral_cloning()
-  Day 5-6 : HybridAgentPolicy  (under-70%-sure rule + RL hook)
-  Day 7   : Full test suite  +  __main__ evaluation report
+  Day 3   : MPCFallback (shortlist + planner shared with the simulator)
+  Day 4   : DecisionModel    +  train_behavioral_cloning()  on simulator Oracle data
+  Day 5-6 : HybridAgentPolicy  (shortlist mask + under-70%-sure rule)
+  Day 7   : Evaluation report (__main__); tests live in test_agent_brain.py
+
+Not here yet: reinforcement learning. ClusterEnv (simulator.py) is the RL
+environment; the decision model will be fine-tuned with MaskablePPO on it.
 
 External deps
 -------------
   numpy        - arrays, statistics
-  scikit-learn - MLPClassifier (lightweight neural network)
-  unittest     - tests (self-contained, no extra install needed)
+  scikit-learn - MLPClassifier (lightweight neural network) + calibration
 
 Usage
 -----
-  python agent_brain.py          # runs evaluation + test suite
-  pytest agent_brain.py -v       # pytest mode
+  python agent_brain.py          # runs evaluation report + test suite
+  pytest test_agent_brain.py -v  # tests only
 """
 
 from __future__ import annotations
@@ -40,65 +42,39 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf_8")
     except AttributeError:
         pass  # stdout has no buffer in some environments (e.g. IDLE) - skip
 import unittest
-from dataclasses import dataclass, field
-from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Tuple
-from unittest.mock import MagicMock
+from dataclasses import dataclass
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
 # ---- scikit-learn (required) -------------------------------------------------
 try:
+    from sklearn.calibration import CalibratedClassifierCV
     from sklearn.neural_network import MLPClassifier
     from sklearn.preprocessing import LabelEncoder
-    from sklearn.calibration import CalibratedClassifierCV
-    _SKL_OK = True
 except ImportError:
     raise ImportError("scikit-learn is required.  pip install scikit-learn")
 
-# ---- Optional simulator import -----------------------------------------------
-try:
-    from simulator import (
-        Action, Observation, MachineObs, BasePolicy,
-    )
-    _SIM_OK = True
-except ImportError:
-    _SIM_OK = False
+try:  # scikit-learn >= 1.6; cv="prefit" was removed in 1.8
+    from sklearn.frozen import FrozenEstimator
+except ImportError:  # pragma: no cover - older scikit-learn
+    FrozenEstimator = None
 
-    class BasePolicy:
-        name: str = "BasePolicy"
-        def decide(self, obs: Observation) -> Action:
-            raise NotImplementedError
-
-    class Action(Enum):
-        WAIT       = auto()
-        REBALANCE  = auto()
-        COMPENSATE = auto()
-        EVICT      = auto()
-        READMIT    = auto()
-        RESTART    = auto()
-        CHECKPOINT = auto()
-
-    @dataclass
-    class MachineObs:
-        alive_signal_age: float
-        normal_speed:     float
-        measured_speed:   float
-        share:            float
-        code_version:     str
-        price:            float
-        is_active:        bool = True
-
-    @dataclass
-    class Observation:
-        time:     float
-        step:     int
-        machines: Dict[str, MachineObs]
+from simulator import (
+    CRASH_SIGNAL_AGE_S, SLOW_RATIO_THRESHOLD,
+    Action, BasePolicy, DoNothingPolicy, MachineObs, Observation, OraclePolicy,
+    PolicyOutput, RandomFaultGenerator, RebalanceOnlyPolicy, SimulatedCluster,
+    TimeDelayedPolicy, _unpack, is_readmittable, plan_action, proportional_shares,
+    run_episode, speed_ratio, step_time,
+)
 
 
 # =============================================================================
 # HELPERS
 # =============================================================================
+
+NORMAL_SPEEDS = {"mac-m2": 1.2, "win-gpu-0": 3.5, "win-gpu-1": 3.5}
+
 
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
@@ -114,34 +90,41 @@ class FaultDetection:
     machine_id:  str
     fault_kind:  str    # "none" | "fail-stop" | "fail-slow"
     step:        int
-    speed_ratio: float  # measured / normal  (0..1+)
+    speed_ratio: float  # smoothed speed / normal  (0..1+)
     ema_speed:   float
-    z_score:     float
+    z_score:     float  # how many noise-sigmas below normal the smoothed speed is
 
 
 class MachineDetector:
     """
-    Per-machine streaming anomaly detector using EMA + z-score change test.
+    Per-machine streaming detector, judged against the machine's OWN normal speed.
 
     Fault classification
     --------------------
     fail-stop : measured_speed <= STOP_SPEED_THRESHOLD  OR
                 alive_signal_age > CRASH_SIGNAL_AGE
-    fail-slow : speed_ratio < SLOW_RATIO_THRESHOLD AND z_score > Z_THRESHOLD
+    fail-slow : EMA-smoothed speed < SLOW_RATIO_THRESHOLD * normal for
+                CONFIRM_STEPS consecutive updates (after warmup). It stays
+                flagged for as long as the machine is slow.
     none      : normal operation
+
+    The baseline is the machine's normal speed, not a moving average, so the
+    detector cannot "get used to" a slowdown and go quiet while it lasts.
     """
-    EMA_ALPHA:            float = 0.15   # higher -> more reactive
-    SLOW_RATIO_THRESHOLD: float = 0.70   # below 70% of normal -> candidate slow
-    Z_THRESHOLD:          float = 2.0    # 2-sigma confirmation
+    EMA_ALPHA:            float = 0.5    # smoothing of the noisy speed signal
+    SLOW_RATIO_THRESHOLD: float = SLOW_RATIO_THRESHOLD
+    CONFIRM_STEPS:        int   = 2      # consecutive slow readings before flagging
     STOP_SPEED_THRESHOLD: float = 0.05   # steps/s; below this -> stopped
-    CRASH_SIGNAL_AGE:     float = 3.0    # seconds; above this -> crash
+    CRASH_SIGNAL_AGE:     float = CRASH_SIGNAL_AGE_S
     WARMUP_STEPS:         int   = 5      # ignore first N steps
+    NOISE_FLOOR:          float = 0.01   # minimum noise std, as a fraction of normal
 
     def __init__(self, machine_id: str, normal_speed: float):
         self.machine_id   = machine_id
         self.normal_speed = normal_speed
         self._ema_speed:  float = normal_speed
-        self._ema_sq:     float = normal_speed ** 2
+        self._noise_var:  float = (self.NOISE_FLOOR * normal_speed) ** 2
+        self._slow_run:   int   = 0
         self._step_count: int   = 0
 
     def update(self, step: int, measured_speed: float,
@@ -151,47 +134,31 @@ class MachineDetector:
         # Hard fail-stop check
         if (measured_speed <= self.STOP_SPEED_THRESHOLD
                 or alive_signal_age > self.CRASH_SIGNAL_AGE):
-            return FaultDetection(
-                machine_id  = self.machine_id,
-                fault_kind  = "fail-stop",
-                step        = step,
-                speed_ratio = 0.0,
-                ema_speed   = self._ema_speed,
-                z_score     = float("inf"),
-            )
+            self._slow_run = 0
+            return FaultDetection(self.machine_id, "fail-stop", step, 0.0,
+                                  self._ema_speed, float("inf"))
 
-        # Update EMA and EMA of squares (for running variance)
-        prev_ema = self._ema_speed
         self._ema_speed = (self.EMA_ALPHA * measured_speed
                            + (1 - self.EMA_ALPHA) * self._ema_speed)
-        self._ema_sq    = (self.EMA_ALPHA * measured_speed ** 2
-                           + (1 - self.EMA_ALPHA) * self._ema_sq)
+        ratio = self._ema_speed / self.normal_speed if self.normal_speed > 0 else 1.0
+        slow  = ratio < self.SLOW_RATIO_THRESHOLD
 
-        # Minimum variance floor = (1% of normal_speed)^2 so that the
-        # z-score denominator is never negligibly tiny and the test is
-        # actually sensitive to real slowdowns.
-        min_var  = (0.01 * self.normal_speed) ** 2
-        variance = max(self._ema_sq - self._ema_speed ** 2, min_var)
-        std_dev  = math.sqrt(variance)
+        # Learn the noise level only from healthy readings
+        if not slow:
+            resid = measured_speed - self.normal_speed
+            self._noise_var = max(0.9 * self._noise_var + 0.1 * resid * resid,
+                                  (self.NOISE_FLOOR * self.normal_speed) ** 2)
+        z_score = (self.normal_speed - self._ema_speed) / math.sqrt(self._noise_var)
 
-        # z-score: positive means measured is BELOW prev EMA (slower)
-        z_score     = (prev_ema - measured_speed) / std_dev
-        speed_ratio = (measured_speed / self.normal_speed
-                       if self.normal_speed > 0 else 1.0)
-
-        # fail-slow detection (only after warmup)
-        if (self._step_count > self.WARMUP_STEPS
-                and speed_ratio < self.SLOW_RATIO_THRESHOLD
-                and z_score > self.Z_THRESHOLD):
-            fault_kind = "fail-slow"
-        else:
-            fault_kind = "none"
+        self._slow_run = self._slow_run + 1 if slow else 0
+        flagged = (self._step_count > self.WARMUP_STEPS
+                   and self._slow_run >= self.CONFIRM_STEPS)
 
         return FaultDetection(
             machine_id  = self.machine_id,
-            fault_kind  = fault_kind,
+            fault_kind  = "fail-slow" if flagged else "none",
             step        = step,
-            speed_ratio = speed_ratio,
+            speed_ratio = ratio,
             ema_speed   = self._ema_speed,
             z_score     = z_score,
         )
@@ -221,6 +188,10 @@ class ClusterDetector:
                 measured_speed   = mobs.measured_speed,
                 alive_signal_age = mobs.alive_signal_age,
             )
+            if mobs.evicted:
+                # Out of the ring: not a fault we have to handle (MPC checks READMIT).
+                det = FaultDetection(mid, "none", obs.step, det.speed_ratio,
+                                     det.ema_speed, det.z_score)
             results.append(det)
         return results
 
@@ -269,8 +240,12 @@ def evaluate_detector(
     seed:          int   = 0,
 ) -> Tuple[DetectorEvalResult, DetectorEvalResult]:
     """
-    Generate synthetic traces, inject a slowdown at fault_step, then
-    evaluate the EMA detector vs the naive cross-machine baseline.
+    Generate synthetic noisy traces, slow machine 0 down from fault_step on, and
+    score the EMA detector vs the naive cross-machine baseline PER STEP:
+      TP : fault machine flagged during its fault window
+      FN : fault machine not flagged during its fault window
+      FP : any machine flagged when it is not faulty
+    TTN is the number of steps from the fault to the first flag.
     Returns (ema_result, naive_result).
     """
     np_rng = np.random.RandomState(seed)
@@ -279,25 +254,21 @@ def evaluate_detector(
 
     machine_ids   = [f"gpu-{i}" for i in range(n_machines)]
     fault_machine = machine_ids[0]
-
     detectors = {mid: MachineDetector(mid, NORMAL_SPEED) for mid in machine_ids}
-    ground_truth_fault_steps: Dict[str, int] = {fault_machine: fault_step}
 
-    # ---- Episode-level metrics -------------------------------------------
-    # Rather than per-step TP/FP/FN (which gives recall ≈ 0 for a detector
-    # that correctly fires once at the change point then adapts), we measure:
-    #   TP : fault machine detected at least once inside its fault window.
-    #   FN : fault machine never detected during its fault window.
-    #   FP : any non-fault machine flagged at least once during normal steps.
-    #
-    ema_episode_detected:   Dict[str, bool] = {fault_machine: False}
-    naive_episode_detected: Dict[str, bool] = {fault_machine: False}
-    ema_ttn_list: List[float]   = []
-    naive_ttn_list: List[float] = []
-    ema_first_detected:   Dict[str, Optional[int]] = {fault_machine: None}
-    naive_first_detected: Dict[str, Optional[int]] = {fault_machine: None}
-    ema_fp_count   = 0
-    naive_fp_count = 0
+    counts = {"ema": [0, 0, 0], "naive": [0, 0, 0]}          # tp, fp, fn
+    first:  Dict[str, Optional[int]] = {"ema": None, "naive": None}
+
+    def score(name: str, mid: str, flagged: bool, step: int) -> None:
+        faulty = mid == fault_machine and step >= fault_step
+        if faulty and flagged:
+            counts[name][0] += 1
+            if first[name] is None:
+                first[name] = step
+        elif faulty:
+            counts[name][2] += 1
+        elif flagged:
+            counts[name][1] += 1
 
     for step in range(total_steps):
         machines_obs: Dict[str, MachineObs] = {}
@@ -307,86 +278,32 @@ def evaluate_detector(
                 spd = NORMAL_SPEED * (1.0 - slowdown_frac) + noise
             else:
                 spd = NORMAL_SPEED + noise
-            spd = max(0.01, spd)
             machines_obs[mid] = MachineObs(
                 alive_signal_age = 0.1,
                 normal_speed     = NORMAL_SPEED,
-                measured_speed   = spd,
+                measured_speed   = max(0.01, spd),
                 share            = 1.0 / n_machines,
                 code_version     = "v1.0",
                 price            = 0.50,
                 is_active        = True,
             )
         obs = Observation(time=float(step) * 0.3, step=step, machines=machines_obs)
-        in_fault_window = step >= fault_step
 
-        # ---- EMA detector -----------------------------------------------
         for mid in machine_ids:
-            mobs   = machines_obs[mid]
-            result = detectors[mid].update(step, mobs.measured_speed, mobs.alive_signal_age)
-            flagged = result.fault_kind in ("fail-stop", "fail-slow")
+            r = detectors[mid].update(step, machines_obs[mid].measured_speed, 0.1)
+            score("ema", mid, r.fault_kind != "none", step)
+        for mid, kind in _naive_detect(obs):
+            score("naive", mid, kind != "none", step)
 
-            if mid == fault_machine and in_fault_window:
-                if flagged:
-                    ema_episode_detected[mid] = True
-                    if ema_first_detected.get(mid) is None:
-                        ema_first_detected[mid] = step
-            elif not in_fault_window and flagged:
-                # False positive on a non-faulty machine/step
-                ema_fp_count += 1
-
-        # ---- Naive detector ---------------------------------------------
-        for (mid, kind) in _naive_detect(obs):
-            flagged = kind in ("fail-stop", "fail-slow")
-
-            if mid == fault_machine and in_fault_window:
-                if flagged:
-                    naive_episode_detected[mid] = True
-                    if naive_first_detected.get(mid) is None:
-                        naive_first_detected[mid] = step
-            elif not in_fault_window and flagged:
-                naive_fp_count += 1
-
-    # ---- Time-to-Notice -------------------------------------------------
-    for mid, fs in ground_truth_fault_steps.items():
-        if ema_first_detected.get(mid) is not None:
-            ema_ttn_list.append(ema_first_detected[mid] - fs)
-        if naive_first_detected.get(mid) is not None:
-            naive_ttn_list.append(naive_first_detected[mid] - fs)
-
-    # ---- Episode-level PRF ----------------------------------------------
-    # One fault machine = one episode.
-    ema_tp  = sum(1 for v in ema_episode_detected.values()  if v)
-    ema_fn  = sum(1 for v in ema_episode_detected.values()  if not v)
-    naive_tp = sum(1 for v in naive_episode_detected.values() if v)
-    naive_fn = sum(1 for v in naive_episode_detected.values() if not v)
-    # FP: cap at 1 per non-fault machine per run to avoid metric explosion
-    ema_fp_ep   = min(ema_fp_count,   1)
-    naive_fp_ep = min(naive_fp_count, 1)
-
-    def _prf(tp, fp, fn):
+    def _result(name: str, label: str) -> DetectorEvalResult:
+        tp, fp, fn = counts[name]
         p  = tp / (tp + fp) if (tp + fp) > 0 else 0.0
         r  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
         f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
-        return p, r, f1
+        ttn = float(first[name] - fault_step) if first[name] is not None else float("inf")
+        return DetectorEvalResult(label, p, r, f1, ttn, tp, fp, fn)
 
-    ep, er, ef   = _prf(ema_tp,   ema_fp_ep,   ema_fn)
-    np_, nr, nf  = _prf(naive_tp, naive_fp_ep, naive_fn)
-
-    return (
-        DetectorEvalResult(
-            detector_name      = "EMA-ZScore Detector",
-            precision          = ep, recall = er, f1 = ef,
-            avg_time_to_notice = float(np.mean(ema_ttn_list)) if ema_ttn_list else float("inf"),
-            tp = ema_tp, fp = ema_fp_ep, fn = ema_fn,
-        ),
-        DetectorEvalResult(
-            detector_name      = "Naive Cross-Machine",
-            precision          = np_, recall = nr, f1 = nf,
-            avg_time_to_notice = float(np.mean(naive_ttn_list)) if naive_ttn_list else float("inf"),
-            tp = naive_tp, fp = naive_fp_ep, fn = naive_fn,
-        ),
-    )
+    return _result("ema", "EMA Detector"), _result("naive", "Naive Cross-Machine")
 
 
 # =============================================================================
@@ -398,41 +315,32 @@ class DiagnosedFault:
     machine_id:   str
     fault_kind:   str    # "fail-stop" | "fail-slow" | "none"
     severity:     float  # 0..1
-    duration_est: int    # estimated remaining steps
+    duration_est: int    # steps the decision must pay off over
 
 
 class MPCFallback:
     """
-    Model Predictive Control fallback calculator.
+    Model Predictive Control fallback.
 
-    Shortlists 3 candidate actions per fault type, runs a 10-step
-    goodput-per-dollar heuristic projection for each, returns the best.
+    Shortlists at most 3 actions for the diagnosed fault, predicts each one's
+    goodput over the horizon with simulator.plan_action (the same model the
+    Oracle uses, tested against the real cluster), and returns the best.
+    WAIT wins ties.
 
-    Candidate sets
-    --------------
-    fail-stop  -> [EVICT,     WAIT,       RESTART]
-    fail-slow  -> [REBALANCE, COMPENSATE, WAIT]
-    none       -> [WAIT,      CHECKPOINT, REBALANCE]
+    Shortlists
+    ----------
+    fail-stop  -> [EVICT, WAIT]
+    fail-slow  -> [WAIT, COMPENSATE, EVICT]
+    none       -> [WAIT, REBALANCE, READMIT]   (REBALANCE helps after a recovery,
+                                               READMIT brings back a healed machine)
     """
-    HORIZON:        int   = 10
-    STALL_COST:     float = 1.0
-    REBAL_OVERHEAD: float = 0.5
+    HORIZON: int = 100   # steps an action must pay off over when no estimate is given
 
-    def __init__(
-        self,
-        horizon: Optional[int] = None,
-        stall_cost: Optional[float] = None,
-        rebal_overhead: Optional[float] = None,
-        **kwargs,
-    ):
+    def __init__(self, horizon: Optional[int] = None, **kwargs):
         if horizon is not None:
             self.HORIZON = horizon
         elif "H" in kwargs:
             self.HORIZON = kwargs["H"]
-        if stall_cost is not None:
-            self.STALL_COST = stall_cost
-        if rebal_overhead is not None:
-            self.REBAL_OVERHEAD = rebal_overhead
 
     def decide(
         self,
@@ -441,128 +349,49 @@ class MPCFallback:
     ) -> Tuple[Action, float, Dict[str, float]]:
         """
         Returns (best_action, best_projection, all_projections).
-        all_projections: {action_name: projected_goodput_per_dollar}
+        all_projections: {action_name: projected goodput (steps/hour)}
         """
-        candidates = self._shortlist(fault)
+        horizon = fault.duration_est if fault.duration_est > 0 else self.HORIZON
         projections: Dict[str, float] = {}
-        for action in candidates:
-            projections[action.name] = self._project(action, fault, obs)
-        best = max(candidates, key=lambda a: projections[a.name])
-        return best, projections[best.name], projections
+        best, best_val = Action.WAIT, -1.0
+        for action, target in self.shortlist(fault, obs):
+            val = self._project(action, target, obs, horizon)
+            projections[action.name] = max(val, projections.get(action.name, -1.0))
+            if val > best_val + 1e-9:
+                best, best_val = action, val
+        return best, best_val, projections
 
-    def _shortlist(self, fault: DiagnosedFault) -> List[Action]:
+    def shortlist(self, fault: DiagnosedFault, obs: Observation) -> List[Tuple[Action, Optional[str]]]:
         if fault.fault_kind == "fail-stop":
-            return [Action.EVICT, Action.WAIT, Action.RESTART]
+            return [(Action.EVICT, fault.machine_id), (Action.WAIT, None)]
         if fault.fault_kind == "fail-slow":
-            return [Action.REBALANCE, Action.COMPENSATE, Action.WAIT]
-        # Healthy cluster: WAIT and CHECKPOINT are the only sensible actions.
-        # REBALANCE on a healthy cluster incurs overhead with no benefit.
-        return [Action.WAIT, Action.CHECKPOINT]
+            return [(Action.WAIT, None), (Action.COMPENSATE, fault.machine_id),
+                    (Action.EVICT, fault.machine_id)]
+        return ([(Action.WAIT, None), (Action.REBALANCE, None)]
+                + [(Action.READMIT, mid) for mid, m in obs.machines.items() if is_readmittable(m)])
 
-    def _project(self, action: Action, fault: DiagnosedFault,
-                 obs: Observation) -> float:
-        """
-        Heuristic 10-step goodput/$ projection.
-
-        WAIT     - cluster runs at its current degraded speed (bottleneck).
-        REBALANCE/COMPENSATE - redistribute shares proportional to current
-                               speed, so the bottleneck step duration drops
-                               significantly when the slow machine gets a
-                               smaller share.  One overhead step is charged.
-        EVICT    - remove the faulty machine; remaining machines share load.
-        RESTART  - pay fault.duration_est/2 upfront, then run at full speed.
-        """
-        H = self.HORIZON
-        active = {
-            mid: mobs for mid, mobs in obs.machines.items()
-            if mobs.is_active and mobs.measured_speed > 0.01
-        }
-        total_price_hr = sum(
-            mobs.price for mobs in obs.machines.values() if mobs.is_active
-        )
-        useful_steps = 0.0
-        total_time_s = 0.0
-        overhead_paid = False
-
-        for h in range(H):
-            machines_this = dict(active)
-
-            if action == Action.EVICT and not overhead_paid:
-                machines_this = {
-                    mid: m for mid, m in machines_this.items()
-                    if mid != fault.machine_id
-                }
-                overhead_paid = True
-
-            elif action in (Action.REBALANCE, Action.COMPENSATE) and not overhead_paid:
-                total_time_s += self.REBAL_OVERHEAD
-                overhead_paid = True
-                # Don't count overhead step as useful
-                continue
-
-            elif action == Action.RESTART and not overhead_paid:
-                total_time_s += fault.duration_est / 2.0
-                overhead_paid = True
-
-            if not machines_this:
-                total_time_s += self.STALL_COST
-                continue
-
-            n = len(machines_this)
-
-            if action == Action.WAIT and fault.fault_kind == "fail-stop" and h < fault.duration_est:
-                # Cluster fully stalled by a crashed machine that is not evicted
-                total_time_s += self.STALL_COST
-
-            elif action in (Action.REBALANCE, Action.COMPENSATE):
-                # Speed-proportional shares -> step duration = 1/sum_speeds
-                this_total_spd = sum(m.measured_speed for m in machines_this.values())
-                step_dur = 1.0 / max(this_total_spd, 0.01)
-                total_time_s += step_dur
-                useful_steps += 1.0
-
-            elif action == Action.EVICT:
-                if machines_this:
-                    this_spd = sum(m.measured_speed for m in machines_this.values())
-                    step_dur = 1.0 / max(this_spd, 0.01)
-                    total_time_s += step_dur
-                    useful_steps += 1.0
-                else:
-                    total_time_s += self.STALL_COST
-
-            else:
-                # WAIT (no fault or fail-slow) and RESTART (after overhead):
-                # Equal-share bottleneck: step_dur = (1/n) / min_speed
-                slowest_spd = min(m.measured_speed for m in machines_this.values())
-                step_dur    = (1.0 / n) / max(slowest_spd, 0.01)
-                total_time_s += step_dur
-                useful_steps += 1.0
-
-        cost = total_price_hr * (total_time_s / 3600.0)
-        if cost < 1e-9:
-            return useful_steps / max(total_time_s / 3600.0, 1e-9)
-        return useful_steps / cost
+    @staticmethod
+    def _project(action: Action, target: Optional[str], obs: Observation, horizon: int) -> float:
+        """Goodput (steps/hour) over `horizon` steps if we take `action` now."""
+        overhead, st = plan_action(obs, action, target)
+        if not math.isfinite(st):
+            return 0.0
+        return horizon / (overhead + horizon * st) * 3600.0
 
     @staticmethod
     def diagnose(detections: List[FaultDetection],
-                 obs: Observation) -> DiagnosedFault:
+                 obs: Observation,
+                 duration_est: int = 120) -> DiagnosedFault:
         """Convert FaultDetections into the single worst DiagnosedFault."""
-        worst: Optional[FaultDetection] = None
-        for d in detections:
-            if d.fault_kind == "fail-stop":
-                worst = d
-                break
-            if d.fault_kind == "fail-slow" and (
-                    worst is None or worst.fault_kind == "none"):
-                worst = d
-        if worst is None or worst.fault_kind == "none":
-            return DiagnosedFault("none", "none", 0.0, 0)
-        return DiagnosedFault(
-            machine_id   = worst.machine_id,
-            fault_kind   = worst.fault_kind,
-            severity     = _clamp(1.0 - worst.speed_ratio, 0.0, 1.0),
-            duration_est = 20,
-        )
+        stops = [d for d in detections if d.fault_kind == "fail-stop"]
+        slows = [d for d in detections if d.fault_kind == "fail-slow"]
+        if stops:
+            return DiagnosedFault(stops[0].machine_id, "fail-stop", 1.0, duration_est)
+        if slows:
+            worst = min(slows, key=lambda d: d.speed_ratio)
+            return DiagnosedFault(worst.machine_id, "fail-slow",
+                                  _clamp(1.0 - worst.speed_ratio, 0.0, 1.0), duration_est)
+        return DiagnosedFault("none", "none", 0.0, 0)
 
 
 # =============================================================================
@@ -573,36 +402,49 @@ def featurize(obs: Observation) -> np.ndarray:
     """
     Observation -> fixed-length float32 feature vector.
 
-    Per-machine (sorted by id): speed_ratio, signal_age, share, price, is_active
-    Global:  min_ratio, max_ratio, n_inactive, inactive_share_frac
+    Per-machine (sorted by id): speed_ratio, signal_age/10, share, price,
+                                is_active, evicted, compensated
+    Global: min / max active speed ratio, n_inactive,
+            imbalance (step time now / step time with ideal shares - 1),
+            any machine presumed dead, any machine ready to readmit
     """
-    sorted_ids = sorted(obs.machines.keys())
     per_machine: List[float] = []
-    speed_ratios: List[float] = []
-    inactive_count = 0
-    inactive_share = 0.0
-
-    for mid in sorted_ids:
+    ratios: List[float] = []
+    n_inactive = 0
+    for mid in sorted(obs.machines):
         m = obs.machines[mid]
-        ratio = (m.measured_speed / m.normal_speed
-                 if m.normal_speed > 0 else 0.0)
-        speed_ratios.append(ratio)
+        ratio = speed_ratio(m)
         per_machine.extend([
             ratio,
-            _clamp(m.alive_signal_age, 0, 10),
+            _clamp(m.alive_signal_age, 0, 10) / 10.0,
             m.share,
             m.price,
             float(m.is_active),
+            float(m.evicted),
+            float(m.compensated),
         ])
-        if not m.is_active:
-            inactive_count += 1
-            inactive_share += m.share
+        if m.is_active:
+            ratios.append(ratio)
+        else:
+            n_inactive += 1
+
+    speeds = {mid: m.measured_speed for mid, m in obs.machines.items() if m.is_active}
+    shares = {mid: m.share for mid, m in obs.machines.items() if m.is_active}
+    now, ideal = step_time(speeds, shares), step_time(speeds, proportional_shares(speeds))
+    imbalance = _clamp(now / ideal - 1.0, 0.0, 5.0) if math.isfinite(now) and ideal > 0 else 5.0
+
+    any_dead = any(not m.evicted and (m.measured_speed < 0.01
+                                      or m.alive_signal_age > CRASH_SIGNAL_AGE_S)
+                   for m in obs.machines.values())
+    any_readmit = any(is_readmittable(m) for m in obs.machines.values())
 
     global_feats = [
-        min(speed_ratios) if speed_ratios else 0.0,
-        max(speed_ratios) if speed_ratios else 0.0,
-        float(inactive_count),
-        inactive_share,
+        min(ratios) if ratios else 0.0,
+        max(ratios) if ratios else 0.0,
+        float(n_inactive),
+        imbalance,
+        float(any_dead),
+        float(any_readmit),
     ]
     return np.array(per_machine + global_feats, dtype=np.float32)
 
@@ -611,52 +453,100 @@ def featurize(obs: Observation) -> np.ndarray:
 # DAY 4 - DECISION MODEL
 # =============================================================================
 
+def expected_calibration_error(conf: np.ndarray, correct: np.ndarray, n_bins: int = 10) -> float:
+    """
+    ECE: bucket predictions by confidence; in each bucket compare average
+    confidence with actual accuracy; average the gaps, weighted by bucket size.
+    0 = confidence means exactly what it says.
+    """
+    conf    = np.asarray(conf, dtype=np.float64)
+    correct = np.asarray(correct, dtype=np.float64)
+    edges   = np.linspace(0.0, 1.0, n_bins + 1)
+    bucket  = np.clip(np.digitize(conf, edges[1:-1], right=True), 0, n_bins - 1)
+    ece = 0.0
+    for b in range(n_bins):
+        mask = bucket == b
+        if mask.any():
+            ece += mask.mean() * abs(correct[mask].mean() - conf[mask].mean())
+    return float(ece)
+
+
 class DecisionModel:
     """
     Lightweight neural network (MLP 64x64 ReLU) trained via behavioral
     cloning to mimic the Oracle policy.
 
-    Probability calibration via Platt scaling (CalibratedClassifierCV)
-    ensures confidence scores are trustworthy for the under-70%-sure rule.
+    The rows are split in order (Oracle data is grouped by episode, so this
+    keeps whole episodes apart): 60% train, 20% calibrate, 20% measure ECE.
+    Calibration (Platt scaling) is fitted on data the network never saw, so the
+    confidence used by the under-70%-sure rule means what it says.
+    Rare actions are oversampled in the training split: the Oracle WAITs on
+    almost every step, and without this the network just predicts WAIT.
     """
 
-    def __init__(self, hidden_layer_sizes: Tuple[int, ...] = (64, 64)):
+    MIN_CLASS_FRACTION: float = 0.10   # oversample each action to >= 10% of WAIT
+
+    def __init__(self, hidden_layer_sizes: Tuple[int, ...] = (64, 64), seed: int = 42):
         self._base = MLPClassifier(
             hidden_layer_sizes  = hidden_layer_sizes,
             activation          = "relu",
             solver              = "adam",
             max_iter            = 500,
-            random_state        = 42,
+            random_state        = seed,
             learning_rate_init  = 1e-3,
             early_stopping      = True,
             validation_fraction = 0.10,
             n_iter_no_change    = 15,
         )
+        self._seed = seed
         self._calibrated: Optional[CalibratedClassifierCV] = None
         self._label_encoder = LabelEncoder()
         self._is_trained = False
         self.classes_: List[str] = []
+        self.calibration_ece: float = float("nan")
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "DecisionModel":
         """Train on (N,F) feature matrix and (N,) string action labels."""
         y_enc = self._label_encoder.fit_transform(y)
         self.classes_ = list(self._label_encoder.classes_)
-        self._base.fit(X, y_enc)
-        # Use cv='prefit' so calibration wraps the already-trained base
-        # estimator without spawning 3 cross-validated clones.  This keeps
-        # inference latency well below the 1 ms target.
-        self._calibrated = CalibratedClassifierCV(
-            self._base, method="sigmoid", cv="prefit"
-        )
-        self._calibrated.fit(X, y_enc)
+        n = len(X)
+        a, b = int(n * 0.6), int(n * 0.8)
+
+        X_tr, y_tr = self._oversample(X[:a], y_enc[:a])
+        self._base.fit(X_tr, y_tr)
+
+        if FrozenEstimator is not None:
+            self._calibrated = CalibratedClassifierCV(FrozenEstimator(self._base), method="sigmoid")
+        else:  # pragma: no cover - older scikit-learn
+            self._calibrated = CalibratedClassifierCV(self._base, method="sigmoid", cv="prefit")
+        self._calibrated.fit(X[a:b], y_enc[a:b])
         self._is_trained = True
+
+        proba   = self._calibrated.predict_proba(X[b:])
+        correct = self._calibrated.classes_[np.argmax(proba, axis=1)] == y_enc[b:]
+        self.calibration_ece = expected_calibration_error(proba.max(axis=1), correct)
         return self
 
+    def _oversample(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        rng = np.random.RandomState(self._seed)
+        counts = np.bincount(y)
+        target = int(counts.max() * self.MIN_CLASS_FRACTION)
+        parts_X, parts_y = [X], [y]
+        for cls, c in enumerate(counts):
+            if 0 < c < target:
+                idx = rng.choice(np.flatnonzero(y == cls), size=target - c, replace=True)
+                parts_X.append(X[idx])
+                parts_y.append(y[idx])
+        return np.vstack(parts_X), np.concatenate(parts_y)
+
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        """Return (N, C) calibrated probability matrix."""
+        """Return (N, C) calibrated probability matrix over self.classes_."""
         if not self._is_trained or self._calibrated is None:
             raise RuntimeError("Model not trained. Call fit() first.")
-        return self._calibrated.predict_proba(X)
+        proba = self._calibrated.predict_proba(X)
+        full  = np.zeros((len(X), len(self.classes_)))
+        full[:, self._calibrated.classes_] = proba   # classes absent from the calibration split get 0
+        return full
 
     def predict(self, X: np.ndarray) -> Tuple[List[str], np.ndarray]:
         """Returns (action_name_list, confidences_array)."""
@@ -691,7 +581,7 @@ def train_behavioral_cloning(
 
     Parameters
     ----------
-    oracle_observations : list of Observation objects
+    oracle_observations : list of Observation objects (keep episodes together)
     oracle_actions      : matching list of Action enums (oracle labels)
     hidden_layer_sizes  : MLP topology
     verbose             : print training stats
@@ -712,7 +602,7 @@ def train_behavioral_cloning(
     if verbose:
         unique, counts = np.unique(y, return_counts=True)
         for u, c in zip(unique, counts):
-            print(f"    {u:<14s}: {c:>4d} ({100*c/len(y):.1f}%)")
+            print(f"    {u:<14s}: {c:>6d} ({100*c/len(y):.1f}%)")
 
     model = DecisionModel(hidden_layer_sizes=hidden_layer_sizes)
     t0    = time.perf_counter()
@@ -720,10 +610,102 @@ def train_behavioral_cloning(
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
     if verbose:
-        preds, _ = model.predict(X)
-        acc = np.mean(np.array(preds) == y)
-        print(f"  [BC] Done in {elapsed_ms:.1f} ms. Train accuracy: {acc*100:.1f}%")
+        print(f"  [BC] Done in {elapsed_ms:.1f} ms. Held-out ECE: {model.calibration_ece:.3f}")
 
+    return model
+
+
+# =============================================================================
+# DAY 4 - ORACLE DATA FROM THE SIMULATOR
+# =============================================================================
+
+class _RecordingPolicy(BasePolicy):
+    """
+    Acts with a `behavior` policy and labels every state it visits with what
+    the Oracle would do there.
+
+    Following the Oracle alone never visits the states the agent really meets
+    (a crash visible only after the heartbeat timeout, a slowdown nobody has
+    handled, skewed shares after a recovery), because the Oracle has already
+    fixed them. Realistic behaviour policies, and later the agent itself
+    (DAgger), reach those states.
+    """
+    name = "OracleRecorder"
+
+    def __init__(self, oracle: OraclePolicy, behavior: BasePolicy):
+        self._oracle   = oracle
+        self._behavior = behavior
+        self.observations: List[Observation] = []
+        self.labels:       List[Action]      = []
+
+    def decide(self, obs: Observation) -> PolicyOutput:
+        self.observations.append(obs)
+        self.labels.append(_unpack(self._oracle.decide(obs))[0])
+        return self._behavior.decide(obs)
+
+
+class _OracleMix(BasePolicy):
+    """Follows the Oracle with probability `follow_prob`, otherwise WAITs."""
+    name = "OracleMix"
+
+    def __init__(self, oracle: OraclePolicy, follow_prob: float, seed: int):
+        self._oracle, self._follow, self._rng = oracle, follow_prob, random.Random(seed)
+
+    def decide(self, obs: Observation) -> PolicyOutput:
+        return self._oracle.decide(obs) if self._rng.random() < self._follow else Action.WAIT
+
+
+def _default_behavior(seed: int, oracle: OraclePolicy) -> BasePolicy:
+    """Rotate through behaviours that react the way a real agent can (after detection)."""
+    return [
+        lambda: _OracleMix(oracle, 0.7, seed),
+        lambda: RebalanceOnlyPolicy(),
+        lambda: TimeDelayedPolicy(10),
+        lambda: TimeDelayedPolicy(60),
+    ][seed % 4]()
+
+
+def generate_oracle_data(
+    seeds:       Iterable[int],
+    total_steps: int = 1000,
+    behavior:    Optional[Callable[[int, OraclePolicy], BasePolicy]] = None,
+) -> Tuple[List[Observation], List[Action]]:
+    """
+    (Observation, Oracle action) pairs from simulator episodes, one episode per
+    seed, kept in seed order. `behavior(seed, oracle)` picks who acts.
+    """
+    behavior = behavior or _default_behavior
+    observations: List[Observation] = []
+    actions:      List[Action]      = []
+    for seed in seeds:
+        gen    = RandomFaultGenerator(seed=seed, total_steps=total_steps)
+        oracle = OraclePolicy(gen)
+        rec    = _RecordingPolicy(oracle, behavior(seed, oracle))
+        run_episode(SimulatedCluster(seed=seed), rec, gen.as_schedule(), total_steps)
+        observations.extend(rec.observations)
+        actions.extend(rec.labels)
+    return observations, actions
+
+
+def train_agent_model(
+    seeds:         Iterable[int],
+    total_steps:   int = 1000,
+    dagger_rounds: int = 1,
+    verbose:       bool = False,
+) -> DecisionModel:
+    """
+    Behavioral cloning + DAgger: train on Oracle labels, then let the trained
+    agent drive, label the states IT visits with the Oracle, add them, retrain.
+    """
+    seeds = list(seeds)
+    obs, acts = generate_oracle_data(seeds, total_steps)
+    model = train_behavioral_cloning(obs, acts, verbose=verbose)
+    for _ in range(dagger_rounds):
+        learner = lambda seed, oracle, m=model: HybridAgentPolicy(
+            m, MPCFallback(), ClusterDetector(NORMAL_SPEEDS))
+        more_obs, more_acts = generate_oracle_data(seeds, total_steps, behavior=learner)
+        obs, acts = more_obs + obs, more_acts + acts   # older data last -> stays in train split
+        model = train_behavioral_cloning(obs, acts, verbose=verbose)
     return model
 
 
@@ -736,12 +718,13 @@ def generate_mock_oracle_data(
     seed:      int = 42,
 ) -> Tuple[List[Observation], List[Action]]:
     """
-    Synthetic (Observation, Action) pairs approximating Oracle policy logic.
+    Synthetic (Observation, Action) pairs from a hand-written rule. Only for fast
+    unit tests of the model plumbing; train real models with generate_oracle_data().
 
-    Label logic (mirrors simulator.py OraclePolicy):
+    Label logic:
       - crash     -> EVICT
-      - slow_major-> COMPENSATE   (speed_ratio 40-55%, long duration)
-      - slow_minor-> REBALANCE    (speed_ratio 65-80%, short duration)
+      - slow_major-> COMPENSATE   (speed_ratio 40-55%)
+      - slow_minor-> REBALANCE    (speed_ratio 65-80%)
       - none      -> WAIT
     """
     rng = np.random.RandomState(seed)
@@ -816,22 +799,27 @@ class HybridAgentPolicy(BasePolicy):
 
     Decision flow
     -------------
-    1. Featurize observation.
-    2. Query DecisionModel for (action, confidence).
-    3. Under-70%-sure rule:
-       confidence >= 0.70  ->  use NN prediction.
-       confidence <  0.70  ->  defer to MPCFallback.
-    4. Total latency target: < 1.0 ms.
+    1. Detector scans the observation (every step, so its state stays current).
+    2. Diagnose -> shortlist of <= 3 allowed actions (the MPC's shortlist).
+    3. DecisionModel predicts (action, confidence).
+    4. confidence >= 0.70 and action in the shortlist -> candidate.
+    5. Shield: if the MPC projects the candidate to be more than SHIELD_MARGIN
+       worse than its own best choice, the MPC's choice is used instead. A model
+       can be confidently wrong in states it never saw in training.
+       Otherwise -> MPCFallback picks from the shortlist.
+    Without a detector there is no diagnosis, so the mask and shield are skipped.
+    Total latency target: < 1.0 ms.
 
     Attributes
     ----------
-    mpc_call_count  : times MPC was invoked.
-    nn_call_count   : times NN prediction was accepted.
+    mpc_call_count  : times MPC decided.
+    nn_call_count   : times the NN prediction was used.
     decision_times  : per-step latencies in ms.
     """
 
     name = "HybridAgentPolicy"
     CONFIDENCE_THRESHOLD: float = 0.70
+    SHIELD_MARGIN:        float = 0.05
 
     def __init__(
         self,
@@ -845,93 +833,54 @@ class HybridAgentPolicy(BasePolicy):
 
         self.mpc_call_count: int = 0
         self.nn_call_count:  int = 0
+        self.shield_count:   int = 0   # NN actions overruled by the shield
         self.decision_times: List[float] = []
 
-    def decide(self, obs: Observation) -> Action:
+    def decide(self, obs: Observation) -> PolicyOutput:
         """Make a decision; records latency internally."""
         t0     = time.perf_counter()
         action = self._decide_internal(obs)
         self.decision_times.append((time.perf_counter() - t0) * 1_000)
         return action
 
-    def _decide_internal(self, obs: Observation) -> Action:
-        # Step 1: featurize
-        x = featurize(obs)
+    def _decide_internal(self, obs: Observation) -> PolicyOutput:
+        # Steps 1-2: detect, diagnose, shortlist
+        detections = self._detector.scan(obs) if self._detector is not None else []
+        fault      = MPCFallback.diagnose(detections, obs)
+        allowed    = ({a for a, _ in self._mpc.shortlist(fault, obs)}
+                      if self._detector is not None else set(Action))
 
-        # Step 2: NN inference
+        # Step 3: NN inference
         if self._model.is_trained:
-            action_name, confidence = self._model.predict_single(x)
+            action_name, confidence = self._model.predict_single(featurize(obs))
         else:
             action_name, confidence = "WAIT", 0.0
 
-        # Step 3: under-70%-sure rule
-        if confidence >= self.CONFIDENCE_THRESHOLD:
+        # Step 4: under-70%-sure rule + shortlist mask
+        nn_action: Optional[Action] = None
+        if confidence >= self.CONFIDENCE_THRESHOLD and action_name in Action.__members__:
+            if Action[action_name] in allowed:
+                nn_action = Action[action_name]
+
+        if nn_action is not None and self._detector is None:
             self.nn_call_count += 1
-            try:
-                return Action[action_name]
-            except KeyError:
-                pass  # unknown label -> fall through to MPC
+            return self._with_target(nn_action, fault)
 
-        # Step 4: MPC fallback
+        # Step 5: MPC (as fallback, or as the shield's yardstick)
+        mpc_action, best, projections = self._mpc.decide(fault, obs)
+        if nn_action is not None:
+            if projections.get(nn_action.name, 0.0) >= (1 - self.SHIELD_MARGIN) * best:
+                self.nn_call_count += 1
+                return self._with_target(nn_action, fault)
+            self.shield_count += 1
         self.mpc_call_count += 1
-        detections: List[FaultDetection] = []
-        if self._detector is not None:
-            detections = self._detector.scan(obs)
-        fault  = MPCFallback.diagnose(detections, obs)
-        action, _, _ = self._mpc.decide(fault, obs)
+        return self._with_target(mpc_action, fault)
+
+    @staticmethod
+    def _with_target(action: Action, fault: DiagnosedFault) -> PolicyOutput:
+        if action in (Action.EVICT, Action.COMPENSATE) and fault.machine_id != "none":
+            return (action, fault.machine_id)
         return action
-
-    def rl_finetune(
-        self,
-        rewards:      List[float],
-        observations: List[Observation],
-        actions:      List[Action],
-    ) -> None:
-        """
-        REINFORCE-style policy gradient fine-tune hook.
-
-        Computes discounted returns, normalises them, then re-trains the
-        DecisionModel using positive-return steps as weighted demonstrations.
-        This improves the model beyond the Oracle by reinforcing steps that
-        led to better actual rewards.
-
-        Parameters
-        ----------
-        rewards      : per-step scalar rewards from ClusterEnv.
-        observations : Observation at each step.
-        actions      : Action taken at each step.
-        """
-        if not observations or not rewards:
-            return
-
-        # Discounted returns
-        gamma = 0.99
-        G: List[float] = []
-        running = 0.0
-        for r in reversed(rewards):
-            running = r + gamma * running
-            G.insert(0, running)
-        G_arr = np.array(G, dtype=np.float64)
-        if G_arr.std() > 1e-8:
-            G_arr = (G_arr - G_arr.mean()) / G_arr.std()
-
-        # Re-train with sample weights via importance resampling.
-        # Note: scikit-learn's MLPClassifier does not support sample_weight in fit(),
-        # so we resample transitions proportional to their positive discounted returns.
-        X = np.vstack([featurize(o) for o in observations])
-        y = np.array([a.name for a in actions])
-        weights = np.clip(G_arr, 0, None) + 0.1  # all weights > 0
-
-        if self._model.is_trained and len(X) > 0:
-            probs = weights / weights.sum()
-            rng = np.random.RandomState(42)
-            indices = rng.choice(len(X), size=len(X), replace=True, p=probs)
-            X_resampled = X[indices]
-            y_resampled = y[indices]
-            try:
-                self._model.fit(X_resampled, y_resampled)
-            except Exception:
-                pass  # production: log and retry
 
     def summary(self) -> str:
         total  = self.nn_call_count + self.mpc_call_count
@@ -942,286 +891,9 @@ class HybridAgentPolicy(BasePolicy):
         return (
             f"  HybridAgentPolicy  total={total}  "
             f"NN={self.nn_call_count} ({nn_pct:.0f}%)  "
-            f"MPC={self.mpc_call_count} ({mpc_pct:.0f}%)  "
+            f"MPC={self.mpc_call_count} ({mpc_pct:.0f}%, shield {self.shield_count})  "
             f"avg_latency={avg_ms:.4f} ms"
         )
-
-
-# =============================================================================
-# DAY 7 - TEST SUITE
-# =============================================================================
-
-class TestMachineDetector(unittest.TestCase):
-    """Unit tests for MachineDetector (Days 1-2)."""
-
-    def test_ema_converges_to_normal_speed(self):
-        """EMA must converge to ~normal_speed after 50 normal steps."""
-        det = MachineDetector("m0", normal_speed=3.5)
-        for s in range(50):
-            det.update(s, measured_speed=3.5, alive_signal_age=0.1)
-        self.assertAlmostEqual(det._ema_speed, 3.5, delta=0.05)
-
-    def test_ema_drops_after_sustained_slowdown(self):
-        """EMA must drop below baseline after a persistent speed reduction."""
-        det = MachineDetector("m0", normal_speed=3.5)
-        for s in range(20):
-            det.update(s, 3.5, 0.1)
-        baseline = det._ema_speed
-        for s in range(20, 60):
-            det.update(s, 3.5 * 0.5, 0.1)
-        self.assertLess(det._ema_speed, baseline)
-
-    def test_fail_stop_via_zero_speed(self):
-        det = MachineDetector("m0", 3.5)
-        r   = det.update(10, measured_speed=0.0, alive_signal_age=0.1)
-        self.assertEqual(r.fault_kind, "fail-stop")
-
-    def test_fail_stop_via_stale_heartbeat(self):
-        det = MachineDetector("m0", 3.5)
-        r   = det.update(10, measured_speed=3.5, alive_signal_age=999.0)
-        self.assertEqual(r.fault_kind, "fail-stop")
-
-    def test_fail_slow_detected_after_warmup(self):
-        """
-        The EMA change-point detector fires at the transition step when
-        z-score spikes above threshold.  The EMA then adapts, so the
-        detector correctly returns 'none' once it has re-baselined.
-        This test checks that at least one step inside the slow window
-        is classified as 'fail-slow'.
-        """
-        det = MachineDetector("m0", normal_speed=3.5)
-        for s in range(30):
-            det.update(s, 3.5, 0.1)
-        detected_any = False
-        for s in range(30, 70):
-            result = det.update(s, 3.5 * 0.5, 0.1)
-            if result.fault_kind == "fail-slow":
-                detected_any = True
-                break   # found it — no need to continue
-        self.assertTrue(
-            detected_any,
-            "Expected at least one 'fail-slow' detection during 50%% slowdown window"
-        )
-
-    def test_no_fault_on_normal_operation(self):
-        """Small normal noise must not trigger any fault."""
-        det = MachineDetector("m0", 3.5)
-        rng = random.Random(0)
-        last = None
-        for s in range(80):
-            spd  = 3.5 * rng.uniform(0.92, 1.08)
-            last = det.update(s, spd, 0.1)
-        self.assertEqual(last.fault_kind, "none")
-
-    def test_evaluate_detector_precision_recall_above_60pct(self):
-        """EMA detector Precision and Recall must both exceed 0.60."""
-        ema_r, _ = evaluate_detector(
-            n_machines=3, total_steps=200,
-            fault_step=40, slowdown_frac=0.50, seed=7,
-        )
-        self.assertGreater(ema_r.precision, 0.60,
-                           f"EMA P={ema_r.precision:.3f}")
-        self.assertGreater(ema_r.recall,    0.60,
-                           f"EMA R={ema_r.recall:.3f}")
-
-    def test_ema_ttn_not_much_worse_than_naive(self):
-        """EMA time-to-notice must be <= naive TTN + 5 steps."""
-        ema_r, naive_r = evaluate_detector(
-            n_machines=3, total_steps=200,
-            fault_step=40, slowdown_frac=0.50, seed=7,
-        )
-        self.assertLessEqual(
-            ema_r.avg_time_to_notice,
-            naive_r.avg_time_to_notice + 5,
-            f"EMA TTN={ema_r.avg_time_to_notice:.1f} > "
-            f"naive TTN={naive_r.avg_time_to_notice:.1f} + 5",
-        )
-
-
-class TestMPCFallback(unittest.TestCase):
-    """Unit tests for MPCFallback (Day 3)."""
-
-    NORMAL  = {"mac-m2": 1.2, "win-gpu-0": 3.5, "win-gpu-1": 3.5}
-    PRICES  = {"mac-m2": 0.0, "win-gpu-0": 0.5, "win-gpu-1": 0.5}
-
-    def _obs(self, speeds: Dict[str, float]) -> Observation:
-        machines = {}
-        for mid, spd in speeds.items():
-            ns = self.NORMAL.get(mid, 3.5)
-            machines[mid] = MachineObs(
-                alive_signal_age = 0.1 if spd > 0 else 10.0,
-                normal_speed     = ns,
-                measured_speed   = spd,
-                share            = 1.0 / len(speeds),
-                code_version     = "v1.0",
-                price            = self.PRICES.get(mid, 0.5),
-                is_active        = spd > 0.01,
-            )
-        return Observation(time=0.0, step=10, machines=machines)
-
-    def test_rebalance_over_wait_for_permanent_50pct_slowdown(self):
-        """
-        REBALANCE or COMPENSATE must beat WAIT for a 50% permanent slowdown
-        (fail-slow with long duration).
-        """
-        mpc   = MPCFallback()
-        obs   = self._obs({"mac-m2": 1.2, "win-gpu-0": 3.5*0.5, "win-gpu-1": 3.5})
-        fault = DiagnosedFault("win-gpu-0", "fail-slow", severity=0.50, duration_est=100)
-        best, _, all_proj = mpc.decide(fault, obs)
-        self.assertIn(
-            best, [Action.REBALANCE, Action.COMPENSATE],
-            f"Expected REBALANCE/COMPENSATE, got {best}. Proj={all_proj}",
-        )
-        active_score = all_proj.get("REBALANCE", 0) + all_proj.get("COMPENSATE", 0)
-        self.assertGreater(active_score, all_proj.get("WAIT", 0),
-                           "Active actions should outscore WAIT")
-
-    def test_evict_chosen_for_crash(self):
-        """EVICT must be the best action for a fail-stop fault."""
-        mpc   = MPCFallback()
-        obs   = self._obs({"mac-m2": 1.2, "win-gpu-0": 0.0, "win-gpu-1": 3.5})
-        fault = DiagnosedFault("win-gpu-0", "fail-stop", severity=1.0, duration_est=999)
-        best, _, _ = mpc.decide(fault, obs)
-        self.assertEqual(best, Action.EVICT, f"Expected EVICT, got {best}")
-
-    def test_wait_on_healthy_cluster(self):
-        """On a healthy cluster MPC must return WAIT or CHECKPOINT."""
-        mpc   = MPCFallback()
-        obs   = self._obs({"mac-m2": 1.2, "win-gpu-0": 3.5, "win-gpu-1": 3.5})
-        fault = DiagnosedFault("none", "none", severity=0.0, duration_est=0)
-        best, _, _ = mpc.decide(fault, obs)
-        self.assertIn(best, [Action.WAIT, Action.CHECKPOINT],
-                      f"Expected WAIT/CHECKPOINT, got {best}")
-
-
-class TestDecisionModel(unittest.TestCase):
-    """Unit tests for DecisionModel + behavioral cloning (Day 4)."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.obs_list, cls.act_list = generate_mock_oracle_data(n_samples=800, seed=0)
-        cls.model = train_behavioral_cloning(cls.obs_list, cls.act_list, verbose=False)
-
-    def test_model_trained_flag(self):
-        self.assertTrue(self.model.is_trained)
-
-    def test_predict_proba_sums_to_one(self):
-        X    = np.vstack([featurize(o) for o in self.obs_list[:20]])
-        sums = self.model.predict_proba(X).sum(axis=1)
-        np.testing.assert_allclose(sums, np.ones(20), atol=1e-5)
-
-    def test_train_accuracy_above_2x_chance(self):
-        X = np.vstack([featurize(o) for o in self.obs_list])
-        y = np.array([a.name for a in self.act_list])
-        preds, _ = self.model.predict(X)
-        acc    = float(np.mean(np.array(preds) == y))
-        chance = 1.0 / len(set(y))
-        self.assertGreater(acc, chance * 2.0,
-                           f"Acc={acc:.2%} not > 2x chance ({chance:.2%})")
-
-    def test_confidence_in_unit_interval(self):
-        X = np.vstack([featurize(o) for o in self.obs_list[:50]])
-        _, confs = self.model.predict(X)
-        self.assertTrue(np.all(confs >= 0.0))
-        self.assertTrue(np.all(confs <= 1.0))
-
-
-class TestHybridPolicy(unittest.TestCase):
-    """Unit tests for HybridAgentPolicy (Days 5-6)."""
-
-    def _simple_obs(self) -> Observation:
-        return Observation(
-            time=0.0, step=5,
-            machines={
-                "mac-m2":    MachineObs(0.1, 1.2, 1.2, 0.33, "v1", 0.0, True),
-                "win-gpu-0": MachineObs(0.1, 3.5, 3.5, 0.33, "v1", 0.5, True),
-                "win-gpu-1": MachineObs(0.1, 3.5, 3.5, 0.34, "v1", 0.5, True),
-            }
-        )
-
-    def _policy(self, mock_model: Any) -> HybridAgentPolicy:
-        return HybridAgentPolicy(mock_model, MPCFallback(), cluster_detector=None)
-
-    def test_low_confidence_routes_to_mpc(self):
-        """
-        60% confidence (< 0.70) -> MPC must be called;
-        mpc_call_count = 1, nn_call_count = 0.
-        """
-        m = MagicMock(spec=DecisionModel)
-        m.is_trained = True
-        m.predict_single.return_value = ("WAIT", 0.60)
-
-        policy = self._policy(m)
-        policy.decide(self._simple_obs())
-
-        m.predict_single.assert_called_once()
-        self.assertEqual(policy.mpc_call_count, 1)
-        self.assertEqual(policy.nn_call_count,  0)
-
-    def test_high_confidence_skips_mpc(self):
-        """
-        95% confidence (>= 0.70) -> NN action returned directly;
-        mpc_call_count = 0, nn_call_count = 1.
-        """
-        m = MagicMock(spec=DecisionModel)
-        m.is_trained = True
-        m.predict_single.return_value = ("WAIT", 0.95)
-
-        policy = self._policy(m)
-        action = policy.decide(self._simple_obs())
-
-        self.assertEqual(action, Action.WAIT)
-        self.assertEqual(policy.mpc_call_count, 0)
-        self.assertEqual(policy.nn_call_count,  1)
-
-    def test_exact_threshold_uses_nn(self):
-        """Confidence == 0.70 should use the NN (>= rule)."""
-        m = MagicMock(spec=DecisionModel)
-        m.is_trained = True
-        m.predict_single.return_value = ("REBALANCE", 0.70)
-
-        policy = self._policy(m)
-        action = policy.decide(self._simple_obs())
-
-        self.assertEqual(action, Action.REBALANCE)
-        self.assertEqual(policy.nn_call_count,  1)
-        self.assertEqual(policy.mpc_call_count, 0)
-
-    def test_decision_latency_under_2ms(self):
-        """
-        Average decide() latency must be < 2.0 ms in the unit test
-        environment.  The evaluation report targets < 1.0 ms on the actual
-        hardware; the 2 ms threshold here accounts for CI/test overhead.
-        """
-        obs_tr, act_tr = generate_mock_oracle_data(n_samples=400, seed=1)
-        model  = train_behavioral_cloning(obs_tr, act_tr, verbose=False)
-        policy = HybridAgentPolicy(model, MPCFallback())
-
-        test_obs, _ = generate_mock_oracle_data(n_samples=50, seed=99)
-        for obs in test_obs:
-            policy.decide(obs)
-
-        avg_ms = sum(policy.decision_times) / len(policy.decision_times)
-        self.assertLess(avg_ms, 2.0,
-                        f"Avg latency {avg_ms:.4f} ms > 2.0 ms (CI threshold)")
-
-    def test_rl_finetune_smoke(self):
-        """rl_finetune() must run without raising exceptions."""
-        obs_tr, act_tr = generate_mock_oracle_data(n_samples=200, seed=2)
-        model  = train_behavioral_cloning(obs_tr, act_tr, verbose=False)
-        policy = HybridAgentPolicy(model, MPCFallback())
-
-        rewards  = [float(i % 3 - 1) for i in range(50)]
-        obs50, acts50 = generate_mock_oracle_data(n_samples=50, seed=3)
-        policy.rl_finetune(rewards, obs50, acts50)   # must not raise
-
-    def test_untrained_model_always_routes_to_mpc(self):
-        """An untrained model must always trigger MPC (5/5 times)."""
-        policy = HybridAgentPolicy(DecisionModel(), MPCFallback())
-        for _ in range(5):
-            policy.decide(self._simple_obs())
-        self.assertEqual(policy.mpc_call_count, 5)
-        self.assertEqual(policy.nn_call_count,  0)
 
 
 # =============================================================================
@@ -1236,14 +908,15 @@ def _section(title: str) -> None:
     print(f"\n{'-'*72}\n  {title}\n{'-'*72}")
 
 
+
 def run_evaluation_report() -> None:
     _banner("TASK C - AGENT BRAIN  |  Full Evaluation Report")
 
     # ------------------------------------------------------------------
     # 1. Detector Evaluation
     # ------------------------------------------------------------------
-    _section("1 / 4   ANOMALY DETECTOR EVALUATION")
-    print("  Generating 200-step synthetic traces (50% slowdown at step 60, 5 seeds) ...")
+    _section("1 / 4   ANOMALY DETECTOR EVALUATION  (per-step, 5 seeds)")
+    print("  200-step synthetic traces, 10% noise, 50% slowdown at step 60 ...")
 
     all_ema, all_naive = [], []
     for seed in range(5):
@@ -1260,7 +933,7 @@ def run_evaluation_report() -> None:
     print(f"\n  {'Detector':<28}  {'Precision':>10}  {'Recall':>8}  "
           f"{'F1':>6}  {'TTN (steps)':>12}")
     print(f"  {'─'*28}  {'─'*10}  {'─'*8}  {'─'*6}  {'─'*12}")
-    for name, lst in [("EMA-ZScore Detector", all_ema), ("Naive Cross-Machine", all_naive)]:
+    for name, lst in [("EMA Detector", all_ema), ("Naive Cross-Machine", all_naive)]:
         print(
             f"  {name:<28}  "
             f"{_avg(lst,'precision'):>10.3f}  "
@@ -1270,80 +943,74 @@ def run_evaluation_report() -> None:
         )
 
     # ------------------------------------------------------------------
-    # 2. Behavioral Cloning / Decision Model
+    # 2. Behavioral Cloning on simulator Oracle data
     # ------------------------------------------------------------------
-    _section("2 / 4   DECISION MODEL  (Behavioral Cloning)")
-    print("  Generating 2000-sample Oracle training dataset ...")
+    _section("2 / 4   DECISION MODEL  (Behavioral Cloning of the simulator Oracle)")
+    print("  Recording Oracle labels on 30 training episodes (seeds 100-129), + 1 DAgger round ...")
 
-    obs_train, act_train = generate_mock_oracle_data(n_samples=2000, seed=42)
-    obs_test,  act_test  = generate_mock_oracle_data(n_samples=400,  seed=99)
+    model = train_agent_model(range(100, 130), total_steps=1000, dagger_rounds=1, verbose=True)
 
-    t0    = time.perf_counter()
-    model = train_behavioral_cloning(obs_train, act_train, verbose=True)
-    t_ms  = (time.perf_counter() - t0) * 1000
-
+    obs_test, act_test = generate_oracle_data(range(0, 5), total_steps=1000)
     X_test = np.vstack([featurize(o) for o in obs_test])
     y_test = np.array([a.name for a in act_test])
     preds, confs = model.predict(X_test)
-    acc       = float(np.mean(np.array(preds) == y_test))
-    avg_conf  = float(np.mean(confs))
-
-    print(f"\n  Training time    : {t_ms:.1f} ms")
-    print(f"  Test accuracy    : {acc*100:.1f}%  (avg confidence: {avg_conf:.3f})")
+    preds = np.array(preds)
+    print(f"\n  Test episodes (seeds 0-4): accuracy {np.mean(preds == y_test)*100:.1f}%, "
+          f"ECE {expected_calibration_error(confs, preds == y_test):.3f}")
     print(f"\n  Per-class accuracy on test set:")
     print(f"  {'Action':<14}  {'Support':>8}  {'Correct':>8}  {'Acc':>8}")
     print(f"  {'─'*14}  {'─'*8}  {'─'*8}  {'─'*8}")
     for cls in sorted(set(y_test)):
         mask    = y_test == cls
         support = int(mask.sum())
-        correct = int((np.array(preds)[mask] == cls).sum())
+        correct = int((preds[mask] == cls).sum())
         print(f"  {cls:<14}  {support:>8d}  {correct:>8d}  {correct/support:>8.1%}")
 
     # ------------------------------------------------------------------
-    # 3. Hybrid Policy Timing
+    # 3. The agent inside the simulator vs the baselines
     # ------------------------------------------------------------------
-    _section("3 / 4   HYBRID POLICY  (timing & routing)")
-    print("  Running 500 decide() calls with real trained model ...")
+    _section("3 / 4   AGENT IN THE SIMULATOR  (seeds 0-4, never used for training)")
 
-    normals  = {"mac-m2": 1.2, "win-gpu-0": 3.5, "win-gpu-1": 3.5}
-    detector = ClusterDetector(normals)
-    policy   = HybridAgentPolicy(model, MPCFallback(), cluster_detector=detector)
+    def make_agent() -> HybridAgentPolicy:
+        return HybridAgentPolicy(model, MPCFallback(), ClusterDetector(NORMAL_SPEEDS))
 
-    timing_obs, _ = generate_mock_oracle_data(n_samples=500, seed=77)
-    for obs in timing_obs:
-        policy.decide(obs)
-
-    times  = np.array(policy.decision_times)
-    avg_ms = float(times.mean())
-    p95_ms = float(np.percentile(times, 95))
-    max_ms = float(times.max())
-    status = "PASS  (< 1.0 ms)" if avg_ms < 1.0 else "FAIL  (> 1.0 ms)"
-
-    print(f"\n{policy.summary()}")
-    print(f"\n  Latency stats over {len(times)} calls:")
-    print(f"    avg  = {avg_ms:.4f} ms   [{status}]")
-    print(f"    p95  = {p95_ms:.4f} ms")
-    print(f"    max  = {max_ms:.4f} ms")
+    contenders = [
+        ("DoNothing",           lambda gen: DoNothingPolicy()),
+        ("Act at once",         lambda gen: RebalanceOnlyPolicy()),
+        ("Wait 60, then act",   lambda gen: TimeDelayedPolicy(60)),
+        ("Hybrid agent",        lambda gen: make_agent()),
+        ("Oracle (upper bound)", lambda gen: OraclePolicy(gen)),
+    ]
+    print(f"\n  {'Policy':<22}  {'Goodput/hr':>11}  {'Goodput/$':>10}  {'Wasted s':>9}  "
+          f"{'NN/MPC':>10}  {'ms/decision':>11}")
+    print(f"  {'─'*22}  {'─'*11}  {'─'*10}  {'─'*9}  {'─'*10}  {'─'*11}")
+    for name, factory in contenders:
+        ghr, gusd, waste, ms = [], [], [], []
+        nn = mpc = 0
+        for seed in range(5):
+            gen = RandomFaultGenerator(seed=seed, total_steps=1000)
+            pol = factory(gen)
+            r = run_episode(SimulatedCluster(seed=seed), pol, gen.as_schedule(), 1000)
+            ghr.append(r.goodput_per_hr); gusd.append(r.goodput_per_usd)
+            waste.append(r.total_wasted_time_s); ms.append(r.avg_decision_ms)
+            if isinstance(pol, HybridAgentPolicy):
+                nn += pol.nn_call_count; mpc += pol.mpc_call_count
+        split = f"{nn}/{mpc}" if nn + mpc else "-"
+        print(f"  {name:<22}  {np.mean(ghr):>11.0f}  {np.mean(gusd):>10.0f}  "
+              f"{np.mean(waste):>9.1f}  {split:>10}  {np.mean(ms):>11.4f}")
 
     # ------------------------------------------------------------------
     # 4. MPC Sanity Check
     # ------------------------------------------------------------------
     _section("4 / 4   MPC FALLBACK SANITY CHECK")
 
-    mpc  = MPCFallback()
-    obs4 = Observation(
-        time=0.0, step=10,
-        machines={
-            "mac-m2":    MachineObs(0.1, 1.2, 1.2,       0.33, "v1", 0.0, True),
-            "win-gpu-0": MachineObs(0.1, 3.5, 3.5*0.50,  0.33, "v1", 0.5, True),
-            "win-gpu-1": MachineObs(0.1, 3.5, 3.5,       0.34, "v1", 0.5, True),
-        }
-    )
+    c = SimulatedCluster(seed=0)
+    c.inject_slowdown("win-gpu-0", 0.50, 100)
     fault4 = DiagnosedFault("win-gpu-0", "fail-slow", severity=0.50, duration_est=100)
-    best4, _, proj4 = mpc.decide(fault4, obs4)
+    best4, _, proj4 = MPCFallback().decide(fault4, c.get_observation())
 
     print(f"\n  Scenario: win-gpu-0 at 50% speed for 100 steps (fail-slow)")
-    print(f"  MPC projections (Goodput / $):")
+    print(f"  MPC projections (Goodput / hr):")
     for aname, val in sorted(proj4.items(), key=lambda x: -x[1]):
         tag = "  <- CHOSEN" if aname == best4.name else ""
         print(f"    {aname:<14s}: {val:>12.2f}{tag}")
@@ -1362,12 +1029,7 @@ if __name__ == "__main__":
     _banner("UNIT TEST SUITE  (Day 7)")
     print()
 
-    loader = unittest.TestLoader()
-    suite  = unittest.TestSuite()
-    for cls in [TestMachineDetector, TestMPCFallback,
-                TestDecisionModel, TestHybridPolicy]:
-        suite.addTests(loader.loadTestsFromTestCase(cls))
-
+    suite  = unittest.defaultTestLoader.loadTestsFromName("test_agent_brain")
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
 
