@@ -640,6 +640,9 @@ class _RecordingPolicy(BasePolicy):
         self.observations: List[Observation] = []
         self.labels:       List[Action]      = []
 
+    def bind(self, cluster, schedule, total_steps) -> None:
+        self._oracle.bind(cluster, schedule, total_steps)
+
     def decide(self, obs: Observation) -> PolicyOutput:
         self.observations.append(obs)
         self.labels.append(_unpack(self._oracle.decide(obs))[0])
@@ -671,19 +674,24 @@ def generate_oracle_data(
     seeds:       Iterable[int],
     total_steps: int = 1000,
     behavior:    Optional[Callable[[int, OraclePolicy], BasePolicy]] = None,
+    difficulty:  str = "easy",
 ) -> Tuple[List[Observation], List[Action]]:
     """
     (Observation, Oracle action) pairs from simulator episodes, one episode per
     seed, kept in seed order. `behavior(seed, oracle)` picks who acts.
+    `difficulty` picks the scenario level (scenarios.py); several can be mixed
+    by passing "realistic,hard,chaos" (cycled per seed).
     """
+    from scenarios import make_scenario
     behavior = behavior or _default_behavior
+    levels   = difficulty.split(",")
     observations: List[Observation] = []
     actions:      List[Action]      = []
-    for seed in seeds:
-        gen    = RandomFaultGenerator(seed=seed, total_steps=total_steps)
-        oracle = OraclePolicy(gen)
+    for i, seed in enumerate(seeds):
+        sc     = make_scenario(seed, levels[i % len(levels)], total_steps)
+        oracle = OraclePolicy(sc.schedule)
         rec    = _RecordingPolicy(oracle, behavior(seed, oracle))
-        run_episode(SimulatedCluster(seed=seed), rec, gen.as_schedule(), total_steps)
+        run_episode(sc.make_cluster(), rec, sc.schedule, total_steps)
         observations.extend(rec.observations)
         actions.extend(rec.labels)
     return observations, actions
@@ -694,18 +702,20 @@ def train_agent_model(
     total_steps:   int = 1000,
     dagger_rounds: int = 1,
     verbose:       bool = False,
+    difficulty:    str = "easy",
 ) -> DecisionModel:
     """
     Behavioral cloning + DAgger: train on Oracle labels, then let the trained
     agent drive, label the states IT visits with the Oracle, add them, retrain.
     """
     seeds = list(seeds)
-    obs, acts = generate_oracle_data(seeds, total_steps)
+    obs, acts = generate_oracle_data(seeds, total_steps, difficulty=difficulty)
     model = train_behavioral_cloning(obs, acts, verbose=verbose)
     for _ in range(dagger_rounds):
         learner = lambda seed, oracle, m=model: HybridAgentPolicy(
             m, MPCFallback(), ClusterDetector(NORMAL_SPEEDS))
-        more_obs, more_acts = generate_oracle_data(seeds, total_steps, behavior=learner)
+        more_obs, more_acts = generate_oracle_data(seeds, total_steps, behavior=learner,
+                                                   difficulty=difficulty)
         obs, acts = more_obs + obs, more_acts + acts   # older data last -> stays in train split
         model = train_behavioral_cloning(obs, acts, verbose=verbose)
     return model

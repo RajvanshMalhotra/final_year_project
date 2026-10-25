@@ -274,3 +274,29 @@ class TestBreakFindings(unittest.TestCase):
     def test_fuzzing_finds_no_violations(self):
         from stress_test import fuzz
         self.assertEqual(fuzz(n_episodes=30, difficulty="chaos", ticks=400), [])
+
+
+class TestOracleAsLabeller(unittest.TestCase):
+
+    # When another policy drives (imitation-learning labels), the Oracle must
+    # notice state changes it did not cause.
+    def test_oracle_replans_after_someone_else_acts(self):
+        sched = FaultSchedule([])
+        c, oracle = SimulatedCluster(0), OraclePolicy(sched)
+        oracle.bind(c, sched, 1000)
+        for _ in range(3):
+            oracle.decide(c.get_observation())
+            c.step_forward(sched)
+        c.apply_action(Action.EVICT, "win-gpu-0")      # not the Oracle's doing
+        self.assertEqual(oracle.decide(c.get_observation()), (Action.READMIT, "win-gpu-0"))
+
+
+class TestReactiveBaseline(unittest.TestCase):
+    """The old baselines never READMIT, so chaos broke them. A fair strong rule must."""
+
+    def test_reactive_rule_readmits_a_recovered_machine(self):
+        from simulator import ReactivePolicy
+        sched = FaultSchedule([FaultEvent(step=10, machine_id="win-gpu-0", kind="crash",
+                                          duration_steps=30)])
+        r = run_episode(SimulatedCluster(0), ReactivePolicy(), sched, 200)
+        self.assertEqual(r.decisions.get("READMIT", 0), 1, r.decisions)

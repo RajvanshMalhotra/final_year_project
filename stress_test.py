@@ -24,7 +24,7 @@ import numpy as np
 from scenarios import DIFFICULTIES, Scenario, make_scenario
 from simulator import (
     STALL_TICK_S, Action, AlwaysRestartPolicy, BasePolicy, DoNothingPolicy, OraclePolicy,
-    RebalanceOnlyPolicy, SimulatedCluster, TimeDelayedPolicy, plan_action, run_episode,
+    ReactivePolicy, RebalanceOnlyPolicy, SimulatedCluster, TimeDelayedPolicy, plan_action, run_episode,
 )
 
 EPS = 1e-9
@@ -113,6 +113,7 @@ def default_policies() -> Dict[str, PolicyFactory]:
         "Do nothing":        lambda sc: DoNothingPolicy(),
         "Restart on crash":  lambda sc: AlwaysRestartPolicy(),
         "Act at once":       lambda sc: RebalanceOnlyPolicy(),
+        "Reactive (+readmit)": lambda sc: ReactivePolicy(),
         "Wait 10, then act": lambda sc: TimeDelayedPolicy(10),
         "Wait 60, then act": lambda sc: TimeDelayedPolicy(60),
         "MPC only":          lambda sc: HybridAgentPolicy(DecisionModel(), MPCFallback(),

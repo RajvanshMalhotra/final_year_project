@@ -910,6 +910,25 @@ class RebalanceOnlyPolicy(BasePolicy):
         return Action.WAIT
 
 
+class ReactivePolicy(BasePolicy):
+    """
+    Baseline 4 - the strongest simple rule: EVICT dead machines, READMIT machines
+    that are back and healthy, REBALANCE as soon as the split is off.
+    """
+    name = "ReactivePolicy"
+
+    def decide(self, observation: Observation) -> PolicyOutput:
+        for mid, m in observation.machines.items():
+            if is_dead(m):
+                return (Action.EVICT, mid)
+        for mid, m in observation.machines.items():
+            if is_readmittable(m):
+                return (Action.READMIT, mid)
+        if shares_imbalanced(observation):
+            return Action.REBALANCE
+        return Action.WAIT
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # §6  AGENT LOOP
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1083,6 +1102,7 @@ class OraclePolicy(BasePolicy):
         self._total_steps: int = 0
         self._last_plan: int = -10 ** 9
         self._acted_last: bool = False
+        self._last_state: Optional[tuple] = None
 
     def bind(self, cluster: "SimulatedCluster", schedule: FaultSchedule, total_steps: int) -> None:
         """
@@ -1142,9 +1162,15 @@ class OraclePolicy(BasePolicy):
 
     # ---- rollout planner (bound) -------------------------------------------
 
+    def _state_signature(self) -> tuple:
+        """Everything an action could change; re-plan when it differs from last time."""
+        return tuple((m.alive, m.evicted, m.compensated, round(m.share, 9), round(m.measured_speed, 9),
+                      round(m.bandwidth, 9)) for m in self._cluster.machines.values())
+
     def _decide_rollout(self, observation: Observation) -> PolicyOutput:
-        tick = observation.step
-        if not (self._acted_last or tick in self._change_ticks
+        tick  = observation.step
+        state = self._state_signature()
+        if not (self._acted_last or tick in self._change_ticks or state != self._last_state
                 or tick - self._last_plan >= self.REPLAN_EVERY):
             return Action.WAIT
         self._last_plan = tick
@@ -1173,6 +1199,7 @@ class OraclePolicy(BasePolicy):
                 if score > best_score + 1e-9:
                     best, best_score = (action, target), score
         self._acted_last = best[0] != Action.WAIT
+        self._last_state = None if self._acted_last else state
         return best if best[0] != Action.WAIT else Action.WAIT
 
     # ---- regime planner (unbound: observation + schedule only) ---------------

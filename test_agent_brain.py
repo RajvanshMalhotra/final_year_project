@@ -481,3 +481,11 @@ class TestShieldAndCoverage(unittest.TestCase):
         # timeout, so each contributes the visible-crash state once (seed 0 follows
         # the Oracle mix, which usually evicts before the crash is visible).
         self.assertGreaterEqual(visible_crash_evicts, 3)
+
+
+class TestHardScenarioData(unittest.TestCase):
+
+    def test_oracle_data_from_realistic_scenarios(self):
+        obs, acts = generate_oracle_data(range(2), total_steps=300, difficulty="realistic")
+        self.assertEqual(len(obs), 600)
+        self.assertTrue(set(acts) - {Action.WAIT}, "the Oracle should act at least once")
