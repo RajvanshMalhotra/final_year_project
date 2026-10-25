@@ -7,6 +7,19 @@ Days 1-2 : Core data structures, SimulatedCluster, agent loop, simple baselines.
 Days 3-7 : RandomFaultGenerator, OraclePolicy, TimeDelayedPolicy, ClusterEnv
             (RL wrapper), ExperimentRunner, multi-seed sweeps, matplotlib plots.
 
+Model of time (fixed 2026-10-25)
+--------------------------------
+* A *tick* is one attempt at a training step. Ticks never go backwards; faults
+  are scheduled on ticks, so a rollback cannot replay them.
+* `train_step` is real training progress. A stalled tick does not advance it and
+  RESTART rewinds it to the last checkpoint, so it is the goodput numerator.
+* Every action except WAIT pauses the whole ring for ACTION_OVERHEAD_S seconds.
+  An action that would change nothing (e.g. REBALANCE on already balanced
+  shares) is free, so repeating it is harmless.
+* A crash is only visible once the machine's heartbeat is older than
+  CRASH_SIGNAL_AGE_S. Until then it still looks alive with its last speed.
+* Only machines in the ring (not evicted) are billed.
+
 External deps (optional)
 ------------------------
   numpy      – multi-seed statistics (mean / std)
@@ -49,12 +62,35 @@ except ImportError:
 class Action(Enum):
     """Every action the self-healing agent may take at each step."""
     WAIT        = auto()   # Do nothing; let the cluster continue as-is.
-    REBALANCE   = auto()   # Re-distribute data shares among alive machines.
-    COMPENSATE  = auto()   # Speed-compensate a slow node (e.g. reduce its share).
-    EVICT       = auto()   # Remove a dead / too-slow node from the ring.
-    READMIT     = auto()   # Re-add a previously evicted node that has recovered.
-    RESTART     = auto()   # Roll back to last checkpoint and re-start training.
+    REBALANCE   = auto()   # Re-split the batch in proportion to current speeds.
+    COMPENSATE  = auto()   # Switch a slow node to a lighter kernel, then re-split.
+    EVICT       = auto()   # Remove a node from the ring (it stays powered on).
+    READMIT     = auto()   # Re-add a previously evicted node that is alive again.
+    RESTART     = auto()   # Relaunch on the survivors from the last checkpoint.
     CHECKPOINT  = auto()   # Persist current model weights to durable storage.
+
+
+# A policy returns an Action, or (Action, target machine id) to pick the target.
+PolicyOutput = Union[Action, Tuple[Action, Optional[str]]]
+
+# Seconds the whole ring pauses while an action runs.
+ACTION_OVERHEAD_S: Dict[Action, float] = {
+    Action.WAIT:        0.0,
+    Action.REBALANCE:   0.5,    # move data shards between workers
+    Action.COMPENSATE:  2.0,    # load a lighter kernel on one worker, then re-split
+    Action.EVICT:       3.0,    # re-form the all-reduce ring without the worker
+    Action.READMIT:     5.0,    # copy current weights to the returning worker
+    Action.RESTART:     30.0,   # relaunch the job and reload the last checkpoint
+    Action.CHECKPOINT:  0.5,    # write adapter + optimizer state
+}
+
+COMPENSATE_SPEEDUP:   float = 1.25   # a lighter kernel wins back part of a degraded worker's speed
+STALL_TICK_S:         float = 1.0    # time lost per tick while the ring waits on a crashed worker
+HEARTBEAT_INTERVAL_S: float = 0.5    # simulated seconds between heartbeats
+CRASH_SIGNAL_AGE_S:   float = 3.0    # heartbeat older than this -> machine is presumed dead
+DEAD_SPEED_THRESHOLD: float = 0.01   # steps/s; below this -> machine is presumed dead
+SLOW_RATIO_THRESHOLD: float = 0.85   # below 85% of its own normal speed -> "slow"
+SHARE_TOLERANCE:      float = 0.02   # shares further than this from ideal -> "imbalanced"
 
 
 @dataclass
@@ -62,11 +98,13 @@ class MachineObs:
     """Per-machine slice of the observation the agent receives."""
     alive_signal_age: float   # Seconds since the last heartbeat was received.
     normal_speed:     float   # Baseline speed in "steps/second" under ideal conditions.
-    measured_speed:   float   # Current measured speed (may be 0 if crashed).
-    share:            float   # Fraction of the dataset this machine currently owns (0-1).
+    measured_speed:   float   # Last measured speed (stale for a machine that went silent).
+    share:            float   # Fraction of each batch this machine currently owns (0-1).
     code_version:     str     # Running code version (used to detect stale replicas).
     price:            float   # Hourly cost in USD for this machine.
-    is_active:        bool = True   # True if alive, not evicted, and operational.
+    is_active:        bool = True    # In the ring and not presumed dead.
+    evicted:          bool = False   # We removed it from the ring (it may still be alive).
+    compensated:      bool = False   # Running the lighter COMPENSATE kernel.
 
     @property
     def active(self) -> bool:
@@ -76,22 +114,23 @@ class MachineObs:
 @dataclass
 class Observation:
     """Global snapshot the agent receives at every step."""
-    time:    float                     # Wall-clock simulation time (seconds).
-    step:    int                       # Current global training step index.
-    machines: Dict[str, MachineObs]   # machine_id -> MachineObs
+    time:       float                     # Wall-clock simulation time (seconds).
+    step:       int                       # Tick index (monotonic; never rewinds).
+    machines:   Dict[str, MachineObs]     # machine_id -> MachineObs
+    train_step: int = 0                   # Training progress (rewinds on RESTART).
 
 
 @dataclass
 class EpisodeResult:
     """Metrics produced at the end of one simulation episode."""
     policy_name:      str
-    total_steps:      int
-    useful_steps:     int      # Steps that produced good gradient updates.
+    total_steps:      int      # Ticks run.
+    useful_steps:     int      # Net training progress at the end (after rollbacks).
     total_time_s:     float    # Total simulated time in seconds.
-    total_cost_usd:   float    # Sum of (machine_price * simulated_hours) over all machines.
+    total_cost_usd:   float    # Sum of price * time over machines while in the ring.
     goodput_per_hr:   float    # useful_steps / (total_time_s / 3600)
     goodput_per_usd:  float    # useful_steps / total_cost_usd
-    total_wasted_time_s: float # Simulated seconds lost to restarts / stalls.
+    total_wasted_time_s: float # Stalls + action overheads + time of rolled-back steps.
     work_lost:        int      # Rolled-back steps (due to RESTART actions).
     avg_decision_ms:  float    # Mean policy decision latency in milliseconds.
     decisions:        Dict[str, int] = field(default_factory=dict)  # Action -> count
@@ -112,18 +151,156 @@ class EpisodeResult:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# §1b  SHARED HELPERS (used by the cluster, the policies, the Oracle and the MPC)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def proportional_shares(speeds: Dict[str, float]) -> Dict[str, float]:
+    """b_i = s_i / sum(s): every worker finishes its part of the batch at the same time."""
+    total = sum(speeds.values())
+    if total <= 0:
+        return {mid: 0.0 for mid in speeds}
+    return {mid: s / total for mid, s in speeds.items()}
+
+
+def step_time(speeds: Dict[str, float], shares: Dict[str, float]) -> float:
+    """Synchronous all-reduce: the step lasts as long as the slowest worker's part."""
+    times = [shares.get(mid, 0.0) / s for mid, s in speeds.items()
+             if s > 0 and shares.get(mid, 0.0) > 0]
+    return max(times) if times else math.inf
+
+
+def speed_ratio(mobs: MachineObs) -> float:
+    return mobs.measured_speed / mobs.normal_speed if mobs.normal_speed > 0 else 0.0
+
+
+def is_dead(mobs: MachineObs) -> bool:
+    """Presumed crashed and still in the ring. An evicted machine is no longer our problem."""
+    return (not mobs.evicted
+            and (mobs.measured_speed < DEAD_SPEED_THRESHOLD
+                 or mobs.alive_signal_age > CRASH_SIGNAL_AGE_S))
+
+
+def is_slow(mobs: MachineObs) -> bool:
+    return mobs.is_active and speed_ratio(mobs) < SLOW_RATIO_THRESHOLD
+
+
+def is_readmittable(mobs: MachineObs) -> bool:
+    """Evicted, still sending heartbeats, and back to (near) normal speed."""
+    return (mobs.evicted
+            and mobs.alive_signal_age <= CRASH_SIGNAL_AGE_S
+            and speed_ratio(mobs) >= SLOW_RATIO_THRESHOLD)
+
+
+def _shares_differ(a: Dict[str, float], b: Dict[str, float], tol: float = 1e-9) -> bool:
+    keys = set(a) | set(b)
+    return any(abs(a.get(k, 0.0) - b.get(k, 0.0)) > tol for k in keys)
+
+
+def shares_imbalanced(obs: Observation, tol: float = SHARE_TOLERANCE) -> bool:
+    """True when the current split is noticeably off from speed-proportional."""
+    speeds = {mid: m.measured_speed for mid, m in obs.machines.items() if m.is_active}
+    shares = {mid: m.share for mid, m in obs.machines.items() if m.is_active}
+    return _shares_differ(proportional_shares(speeds), shares, tol)
+
+
+def default_target(obs: Observation, action: Action) -> Optional[str]:
+    """The machine an action applies to when the policy did not name one."""
+    machines = obs.machines
+    active = [mid for mid, m in machines.items() if m.is_active]
+    if action == Action.EVICT:
+        dead = [mid for mid, m in machines.items() if is_dead(m)]
+        if dead:
+            return dead[0]
+        if len(active) > 1:
+            return min(active, key=lambda mid: speed_ratio(machines[mid]))
+    elif action == Action.COMPENSATE:
+        slow = [mid for mid in active
+                if not machines[mid].compensated and speed_ratio(machines[mid]) < 1.0]
+        if slow:
+            return min(slow, key=lambda mid: speed_ratio(machines[mid]))
+    elif action == Action.READMIT:
+        for mid, m in machines.items():
+            if is_readmittable(m):
+                return mid
+    return None
+
+
+def plan_action(
+    obs: Observation,
+    action: Action,
+    target: Optional[str] = None,
+) -> Tuple[float, float]:
+    """
+    Predict (overhead_s, step_time_s afterwards) of an action, from the observation
+    alone, using the same rules as SimulatedCluster.apply_action. step_time is
+    math.inf when the ring would still be stalled by a dead machine.
+    """
+    if target is None:
+        target = default_target(obs, action)
+    machines = obs.machines
+    in_ring  = {mid for mid, m in machines.items() if not m.evicted}
+    dead     = {mid for mid in in_ring if is_dead(machines[mid])}
+    speeds   = {mid: machines[mid].measured_speed for mid in in_ring - dead}
+    shares   = {mid: machines[mid].share for mid in in_ring - dead}
+    overhead = 0.0
+
+    if action == Action.REBALANCE:
+        new = proportional_shares(speeds)
+        if _shares_differ(new, shares):
+            shares, overhead = new, ACTION_OVERHEAD_S[action]
+
+    elif action == Action.COMPENSATE:
+        m = machines.get(target) if target else None
+        if (m is not None and target in speeds and not m.compensated
+                and m.measured_speed < m.normal_speed):
+            speeds[target] *= COMPENSATE_SPEEDUP
+            shares, overhead = proportional_shares(speeds), ACTION_OVERHEAD_S[action]
+
+    elif action == Action.EVICT:
+        if target in dead:
+            dead.discard(target)
+            shares, overhead = proportional_shares(speeds), ACTION_OVERHEAD_S[action]
+        elif target in speeds and len(speeds) > 1:
+            speeds.pop(target)
+            shares, overhead = proportional_shares(speeds), ACTION_OVERHEAD_S[action]
+
+    elif action == Action.READMIT:
+        m = machines.get(target) if target else None
+        if m is not None and m.evicted and m.alive_signal_age <= CRASH_SIGNAL_AGE_S:
+            speeds[target] = m.measured_speed
+            shares, overhead = proportional_shares(speeds), ACTION_OVERHEAD_S[action]
+
+    elif action == Action.RESTART:
+        dead = set()
+        shares, overhead = proportional_shares(speeds), ACTION_OVERHEAD_S[action]
+
+    elif action == Action.CHECKPOINT:
+        overhead = ACTION_OVERHEAD_S[action]
+
+    if dead:
+        return overhead, math.inf
+    return overhead, step_time(speeds, shares)
+
+
+def _unpack(output: PolicyOutput) -> Tuple[Action, Optional[str]]:
+    if isinstance(output, tuple):
+        return output[0], output[1]
+    return output, None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # §2  FAULT SCHEDULE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class FaultEvent:
     """A single fault injected into the simulation."""
-    step:       int    # Training step at which the fault is injected.
+    step:       int    # Tick at which the fault is injected.
     machine_id: str    # Target machine.
     kind:       str    # "crash" | "slowdown"
     # For "slowdown" only:
-    slowdown_fraction: float = 0.40   # Fraction by which speed is reduced (0.30-0.50).
-    duration_steps:    int   = 20     # How many steps the slowdown lasts.
+    slowdown_fraction: float = 0.40   # Fraction by which speed is reduced.
+    duration_steps:    int   = 20     # How many ticks the slowdown lasts.
 
 
 class FaultSchedule:
@@ -152,17 +329,18 @@ class _MachineState:
     machine_id:      str
     label:           str           # Human-readable label (e.g. "Mac-M2").
     normal_speed:    float         # steps / simulated-second under normal load.
-    measured_speed:  float         # Current speed (may be degraded).
-    share:           float         # Dataset fraction owned by this machine.
-    price_per_hr:    float         # Hourly USD cost.
+    measured_speed:  float         # Current true speed (0 once crashed).
+    share:           float         # Fraction of each batch owned by this machine.
+    price_per_hr:    float         # Hourly USD cost while in the ring.
     code_version:    str = "v1.0"
-    alive:           bool = True
-    evicted:         bool = False
+    alive:           bool = True   # False once crashed (only a crash sets this).
+    evicted:         bool = False  # Our decision; independent of `alive`.
+    compensated:     bool = False
     # Heartbeat tracking
     last_heartbeat:  float = 0.0   # Simulated time of last heartbeat.
+    last_seen_speed: float = 0.0   # What observers still see after a crash.
     # Slowdown tracking
     slowdown_steps_left: int = 0
-    original_speed:      float = 0.0
 
     @property
     def is_active(self) -> bool:
@@ -180,22 +358,35 @@ class SimulatedCluster:
     Time model
     ----------
     Each machine takes `m.share / m.measured_speed` simulated seconds to process its share.
-    The bottleneck is the slowest alive, non-evicted machine (All-reduce barrier).
+    The bottleneck is the slowest machine in the ring (All-reduce barrier). A crashed
+    machine still in the ring stalls every tick for STALL_TICK_S.
     """
 
-    HEARTBEAT_INTERVAL_S: float = 0.5   # Simulated seconds between heartbeats.
-    CRASH_SIGNAL_AGE:     float = 3.0   # Signal age above which a machine is "dead".
+    HEARTBEAT_INTERVAL_S: float = HEARTBEAT_INTERVAL_S
+    CRASH_SIGNAL_AGE:     float = CRASH_SIGNAL_AGE_S
 
-    def __init__(self, seed: int = 42):
+    def __init__(self, seed: int = 42, checkpoint_every: int = 100, verbose: bool = False):
         rng = random.Random(seed)
-        self._sim_time: float = 0.0
-        self._step: int = 0
+        self._sim_time:   float = 0.0
+        self._tick:       int   = 0
+        self._train_step: int   = 0
+        self._cost_usd:   float = 0.0
+        self._checkpoint_every = checkpoint_every
+        self._verbose = verbose
+        self._fired: set = set()          # ids of fault events already injected
+
+        # Bookkeeping for metrics
+        self.stall_time_s:    float = 0.0
+        self.overhead_time_s: float = 0.0
+        self.lost_time_s:     float = 0.0  # time spent on steps later rolled back
+        self.work_lost:       int   = 0
+        self._time_since_ckpt: float = 0.0
 
         # Initialise the three machines
         self._machines: Dict[str, _MachineState] = {
             "mac-m2": _MachineState(
                 machine_id    = "mac-m2",
-                label         = "Mac M2 (CPU/MPS)",
+                label         = "Mac M2 (MLX)",
                 normal_speed  = 1.2,        # steps/sim-second – slowest
                 measured_speed= 1.2,
                 share         = 0.30,
@@ -221,11 +412,11 @@ class SimulatedCluster:
 
         # Stagger initial heartbeats
         for m in self._machines.values():
-            m.last_heartbeat = rng.uniform(0, self.HEARTBEAT_INTERVAL_S)
-            m.original_speed = m.normal_speed
+            m.last_heartbeat = -rng.uniform(0, self.HEARTBEAT_INTERVAL_S)
+            m.last_seen_speed = m.measured_speed
 
         self._last_checkpoint_step: int = 0
-        self._rebalance_shares()   # Distribute initial shares proportional to normal capacity
+        self._rebalance_shares()   # Distribute initial shares proportional to capacity
 
     # Public helpers
 
@@ -235,7 +426,17 @@ class SimulatedCluster:
 
     @property
     def step(self) -> int:
-        return self._step
+        """Tick index (monotonic)."""
+        return self._tick
+
+    @property
+    def train_step(self) -> int:
+        """Net training progress (rewinds on RESTART)."""
+        return self._train_step
+
+    @property
+    def wasted_time_s(self) -> float:
+        return self.stall_time_s + self.overhead_time_s + self.lost_time_s
 
     @property
     def machines(self) -> Dict[str, _MachineState]:
@@ -261,71 +462,95 @@ class SimulatedCluster:
         duration_steps: int = 20,
     ) -> None:
         """Helper to inject a slowdown fault directly."""
-        self._inject_fault(
-            FaultEvent(
-                step=self._step,
-                machine_id=machine_id,
-                kind="slowdown",
-                slowdown_fraction=slowdown_fraction,
-                duration_steps=duration_steps,
-            )
-        )
+        self._inject_fault(FaultEvent(
+            step=self._tick, machine_id=machine_id, kind="slowdown",
+            slowdown_fraction=slowdown_fraction, duration_steps=duration_steps,
+        ))
 
     def inject_crash(self, machine_id: str) -> None:
         """Helper to inject a crash fault directly."""
-        self._inject_fault(
-            FaultEvent(
-                step=self._step,
-                machine_id=machine_id,
-                kind="crash",
-            )
-        )
+        self._inject_fault(FaultEvent(step=self._tick, machine_id=machine_id, kind="crash"))
 
-    def apply_action(self, action: Action, target_machine_id: Optional[str] = None) -> None:
-        """Apply a high-level Action enum to the cluster."""
-        if action == Action.WAIT:
-            pass
-        elif action in (Action.REBALANCE, Action.COMPENSATE):
-            self.apply_rebalance()
+    def fire_due_faults(self, fault_schedule: FaultSchedule) -> None:
+        """Inject every scheduled fault whose tick has come and that has not fired yet."""
+        for event in fault_schedule.events:
+            if event.step <= self._tick and id(event) not in self._fired:
+                self._fired.add(id(event))
+                self._inject_fault(event)
+
+    def apply_action(self, action: Action, target_machine_id: Optional[str] = None) -> Dict[str, float]:
+        """
+        Apply an action. Returns {"overhead_s": ..., "steps_lost": ...}.
+        Without a target, the same default as plan_action() is used.
+        """
+        if target_machine_id is None:
+            target_machine_id = default_target(self.get_observation(), action)
+        m = self._machines.get(target_machine_id) if target_machine_id else None
+        changed    = False
+        steps_lost = 0
+
+        if action == Action.REBALANCE:
+            changed = self._rebalance_shares()
+
+        elif action == Action.COMPENSATE:
+            if (m is not None and m.is_active and not m.compensated
+                    and m.measured_speed < m.normal_speed):
+                m.measured_speed *= COMPENSATE_SPEEDUP
+                m.compensated = True
+                self._rebalance_shares()
+                changed = True
+
         elif action == Action.EVICT:
-            if target_machine_id:
-                self.apply_evict(target_machine_id)
-            else:
-                for mid, m in self._machines.items():
-                    if not m.alive or m.measured_speed <= 0.01:
-                        self.apply_evict(mid)
-                        break
+            in_ring_alive = [x for x in self._machines.values() if x.is_active]
+            if m is not None and not m.evicted and (not m.alive or len(in_ring_alive) > 1):
+                m.evicted = True
+                m.share   = 0.0
+                self._rebalance_shares()
+                changed = True
+
+        elif action == Action.READMIT:
+            if m is not None and m.evicted and m.alive:
+                m.evicted = False
+                self._rebalance_shares()
+                changed = True
+
         elif action == Action.RESTART:
-            self.apply_restart()
+            steps_lost = self.apply_restart()
+            changed = True
+
         elif action == Action.CHECKPOINT:
             self.apply_checkpoint()
-        elif action == Action.READMIT:
-            if target_machine_id:
-                self.apply_readmit(target_machine_id)
-            else:
-                for mid, m in self._machines.items():
-                    if m.evicted and m.alive and m.measured_speed > 0:
-                        self.apply_readmit(mid)
-                        break
+            changed = True
+
+        overhead = ACTION_OVERHEAD_S[action] if changed else 0.0
+        if overhead > 0:
+            self._advance(overhead)
+            self.overhead_time_s += overhead
+        return {"overhead_s": overhead, "steps_lost": float(steps_lost)}
 
     def get_observation(self) -> Observation:
         obs_machines: Dict[str, MachineObs] = {}
         for mid, m in self._machines.items():
-            age = self._sim_time - m.last_heartbeat if m.alive else 9999.0
+            age   = self._sim_time - m.last_heartbeat
+            speed = m.measured_speed if m.alive else m.last_seen_speed
             obs_machines[mid] = MachineObs(
                 alive_signal_age = age,
                 normal_speed     = m.normal_speed,
-                measured_speed   = m.measured_speed if not m.evicted else 0.0,
+                measured_speed   = speed,
                 share            = m.share,
                 code_version     = m.code_version,
                 price            = m.price_per_hr,
-                is_active        = m.is_active,
+                is_active        = (not m.evicted and age <= self.CRASH_SIGNAL_AGE
+                                    and speed > DEAD_SPEED_THRESHOLD),
+                evicted          = m.evicted,
+                compensated      = m.compensated,
             )
-        return Observation(time=self._sim_time, step=self._step, machines=obs_machines)
+        return Observation(time=self._sim_time, step=self._tick,
+                           machines=obs_machines, train_step=self._train_step)
 
     def step_forward(self, fault_schedule: FaultSchedule) -> Tuple[bool, float]:
         """
-        Advance one training step.
+        Advance one tick.
 
         Returns
         -------
@@ -333,143 +558,125 @@ class SimulatedCluster:
             step_was_useful  - False when cluster is stalled (e.g. unevicted crash).
             simulated_seconds - the wall time consumed by this step.
         """
-        # 1. Inject faults scheduled for this step
-        for event in fault_schedule.events_at(self._step):
-            self._inject_fault(event)
+        # 1. Inject faults due now (no-op if run_episode already did)
+        self.fire_due_faults(fault_schedule)
 
-        # 2. Tick slowdown counters
+        # 2. A crashed machine still in the ring freezes the all-reduce barrier
+        ring = [m for m in self._machines.values() if not m.evicted]
+        if any(not m.alive for m in ring) or not any(m.is_active for m in ring):
+            self._advance(STALL_TICK_S)
+            self.stall_time_s += STALL_TICK_S
+            useful, duration = False, STALL_TICK_S
+        else:
+            active   = {m.machine_id: m.measured_speed for m in ring}
+            shares   = {m.machine_id: m.share for m in ring}
+            duration = step_time(active, shares)
+            self._advance(duration)
+            self._train_step      += 1
+            self._time_since_ckpt += duration
+            useful = True
+            if (self._checkpoint_every and self._train_step % self._checkpoint_every == 0
+                    and self._train_step > self._last_checkpoint_step):
+                self.apply_action(Action.CHECKPOINT)
+
+        # 3. Tick slowdown counters for the step that just ran, then move to the next tick
         for m in self._machines.values():
             if m.slowdown_steps_left > 0:
                 m.slowdown_steps_left -= 1
-                if m.slowdown_steps_left == 0:
-                    m.measured_speed = m.original_speed   # recover
+                if m.slowdown_steps_left == 0 and m.alive:
+                    m.measured_speed  = m.normal_speed   # recover
+                    m.last_seen_speed = m.normal_speed
+                    m.compensated     = False
+        self._tick += 1
 
-        # 3. Determine effective cluster speed (All-reduce barrier = slowest partition)
-        # Any active machine that has crashed (measured_speed <= 0 or not alive)
-        # stalls All-Reduce unless evicted.
-        crashed_un_evicted = [
-            m for m in self._machines.values()
-            if not m.evicted and (not m.alive or m.measured_speed <= 0)
-        ]
-        active_machines = [
-            m for m in self._machines.values()
-            if m.alive and not m.evicted and m.measured_speed > 0
-        ]
+        # 4. Faults due at the new tick are visible in the next observation
+        self.fire_due_faults(fault_schedule)
+        return useful, duration
 
-        if crashed_un_evicted or not active_machines:
-            # Complete stall - cluster is frozen waiting for dead machine
-            self._sim_time += 1.0   # 1 second lost
-            self._step += 1
-            return False, 1.0
-
-        # In data parallelism with synchronous All-Reduce, step duration is
-        # bottlenecked by the slowest machine to finish its assigned share:
-        durations = [
-            m.share / m.measured_speed
-            for m in active_machines
-        ]
-        step_duration = max(durations) if durations else 1.0
-
-        # 4. Advance simulated time and emit heartbeats
-        self._sim_time += step_duration
-        for m in self._machines.values():
-            if m.alive and not m.evicted:
-                if (self._sim_time - m.last_heartbeat) >= self.HEARTBEAT_INTERVAL_S:
-                    m.last_heartbeat = self._sim_time
-
-        self._step += 1
-        return True, step_duration
-
-    # Action handlers (called by the agent loop)
+    # Action handlers
 
     def apply_evict(self, machine_id: str) -> None:
         """Remove a machine from the active training ring."""
-        if machine_id in self._machines:
-            m = self._machines[machine_id]
-            m.evicted = True
-            m.alive   = False
-            m.share   = 0.0
-            self._rebalance_shares()
+        self.apply_action(Action.EVICT, machine_id)
 
     def apply_readmit(self, machine_id: str) -> None:
         """Re-admit a previously evicted machine."""
-        if machine_id in self._machines:
-            m = self._machines[machine_id]
-            if m.evicted:
-                m.evicted = False
-                m.alive   = True
-                self._rebalance_shares()
+        self.apply_action(Action.READMIT, machine_id)
 
     def apply_rebalance(self) -> None:
         """Redistribute dataset shares among active machines."""
-        self._rebalance_shares()
+        self.apply_action(Action.REBALANCE)
 
     def apply_restart(self) -> int:
         """
-        Roll back to last checkpoint.
+        Relaunch from the last checkpoint on the machines that are still alive.
 
         Returns the number of steps that were lost (rolled back).
         """
-        steps_lost = self._step - self._last_checkpoint_step
-        self._step = self._last_checkpoint_step
-        # Restore all non-crashed machines
+        steps_lost = self._train_step - self._last_checkpoint_step
+        self._train_step = self._last_checkpoint_step
+        self.work_lost  += steps_lost
+        self.lost_time_s += self._time_since_ckpt
+        self._time_since_ckpt = 0.0
         for m in self._machines.values():
-            if m.alive:
-                m.evicted = False
-                m.measured_speed  = m.normal_speed
-                m.slowdown_steps_left = 0
+            if not m.alive:
+                m.evicted = True     # relaunch without the dead machine
+                m.share   = 0.0
         self._rebalance_shares()
         return steps_lost
 
     def apply_checkpoint(self) -> None:
         """Persist current step as a durable checkpoint."""
-        self._last_checkpoint_step = self._step
+        self._last_checkpoint_step = self._train_step
+        self._time_since_ckpt = 0.0
 
     def total_cost_so_far(self) -> float:
-        """Cumulative USD cost across all machines up to current sim_time."""
-        hours = self._sim_time / 3600.0
-        return sum(m.price_per_hr * hours for m in self._machines.values())
+        """Cumulative USD cost of the machines while they were in the ring."""
+        return self._cost_usd
 
     # Private helpers
 
+    def _advance(self, seconds: float) -> None:
+        """Move the clock, bill machines in the ring, and emit heartbeats."""
+        self._sim_time += seconds
+        self._cost_usd += sum(m.price_per_hr for m in self._machines.values()
+                              if not m.evicted) * seconds / 3600.0
+        for m in self._machines.values():
+            if m.alive and (self._sim_time - m.last_heartbeat) >= self.HEARTBEAT_INTERVAL_S:
+                m.last_heartbeat = self._sim_time
+
     def _inject_fault(self, event: FaultEvent) -> None:
         m = self._machines.get(event.machine_id)
-        if m is None:
+        if m is None or not m.alive:
             return
 
         if event.kind == "crash":
-            m.alive          = False         # process crashed
-            m.measured_speed = 0.0           # no progress
-            m.last_heartbeat = self._sim_time - self.CRASH_SIGNAL_AGE - 0.1
-            print(f"  [FAULT] Step {self._step}: CRASH injected -> {event.machine_id}")
+            m.last_seen_speed = m.measured_speed   # observers keep the last value they saw
+            m.alive           = False              # process crashed
+            m.measured_speed  = 0.0                # no progress
+            m.compensated     = False
+            m.slowdown_steps_left = 0
+            if self._verbose:
+                print(f"  [FAULT] Step {self._tick}: CRASH injected -> {event.machine_id}")
 
         elif event.kind == "slowdown":
-            frac = max(0.30, min(0.50, event.slowdown_fraction))
-            m.original_speed      = m.measured_speed if m.measured_speed > 0 else m.normal_speed
-            m.measured_speed      = m.original_speed * (1.0 - frac)
-            m.slowdown_steps_left = event.duration_steps
-            print(f"  [FAULT] Step {self._step}: SLOWDOWN ({frac*100:.0f}%) injected "
-                  f"-> {event.machine_id} for {event.duration_steps} steps")
+            frac = max(0.0, min(0.95, event.slowdown_fraction))
+            m.measured_speed      = m.normal_speed * (1.0 - frac)
+            m.last_seen_speed     = m.measured_speed
+            m.compensated         = False
+            m.slowdown_steps_left = max(m.slowdown_steps_left, event.duration_steps)
+            if self._verbose:
+                print(f"  [FAULT] Step {self._tick}: SLOWDOWN ({frac*100:.0f}%) injected "
+                      f"-> {event.machine_id} for {event.duration_steps} steps")
 
-    def _rebalance_shares(self) -> None:
-        """Redistribute dataset shares among active machines proportional to their current speed."""
-        active = [m for m in self._machines.values() if m.alive and not m.evicted and m.measured_speed > 0]
-        if not active:
-            for m in self._machines.values():
-                m.share = 0.0
-            return
-        total_speed = sum(m.measured_speed for m in active)
-        if total_speed > 0:
-            for m in active:
-                m.share = m.measured_speed / total_speed
-        else:
-            equal_share = 1.0 / len(active)
-            for m in active:
-                m.share = equal_share
-        # Zero out evicted machines
-        for m in self._machines.values():
-            if m.evicted or not m.alive or m.measured_speed <= 0:
-                m.share = 0.0
+    def _rebalance_shares(self) -> bool:
+        """Split the batch in proportion to current speed. Returns True if shares changed."""
+        active = {mid: m.measured_speed for mid, m in self._machines.items() if m.is_active}
+        new    = proportional_shares(active)
+        old    = {mid: m.share for mid, m in self._machines.items()}
+        for mid, m in self._machines.items():
+            m.share = new.get(mid, 0.0)
+        return _shares_differ(old, {mid: m.share for mid, m in self._machines.items()})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -481,7 +688,7 @@ class BasePolicy:
 
     name: str = "BasePolicy"
 
-    def decide(self, observation: Observation) -> Action:
+    def decide(self, observation: Observation) -> PolicyOutput:
         raise NotImplementedError("Subclasses must implement decide().")
 
 
@@ -496,56 +703,35 @@ class DoNothingPolicy(BasePolicy):
     """
     name = "DoNothingPolicy"
 
-    def decide(self, observation: Observation) -> Action:
+    def decide(self, observation: Observation) -> PolicyOutput:
         return Action.WAIT
 
 
 class AlwaysRestartPolicy(BasePolicy):
     """
-    Baseline 2 - RESTART whenever any machine is dead or signal age is high.
-    Represents the conservative "roll back to checkpoint" strategy.
+    Baseline 2 - RESTART (on the survivors, from the last checkpoint) whenever a
+    machine is presumed dead. The classic checkpoint-restart strategy.
     """
     name = "AlwaysRestartPolicy"
 
-    DEAD_SPEED_THRESHOLD:  float = 0.01   # steps/s; below this -> considered dead.
-    MAX_SIGNAL_AGE_S:      float = SimulatedCluster.CRASH_SIGNAL_AGE
-
-    def decide(self, observation: Observation) -> Action:
-        for mobs in observation.machines.values():
-            is_dead = (mobs.measured_speed < self.DEAD_SPEED_THRESHOLD
-                       or mobs.alive_signal_age > self.MAX_SIGNAL_AGE_S)
-            if is_dead:
-                return Action.RESTART
+    def decide(self, observation: Observation) -> PolicyOutput:
+        if any(is_dead(m) for m in observation.machines.values()):
+            return Action.RESTART
         return Action.WAIT
 
 
 class RebalanceOnlyPolicy(BasePolicy):
     """
-    Baseline 3 - EVICT dead machines; REBALANCE slow ones.
-    Represents a moderate fault-tolerant strategy without rollbacks.
+    Baseline 3 - EVICT dead machines; REBALANCE as soon as the split is off
+    (a machine slowed down or recovered). Reacts immediately, never waits.
     """
     name = "RebalanceOnlyPolicy"
 
-    DEAD_SPEED_THRESHOLD:  float = 0.01
-    SLOW_RATIO_THRESHOLD:  float = 0.65   # < 65% of normal speed -> "slow"
-    MAX_SIGNAL_AGE_S:      float = SimulatedCluster.CRASH_SIGNAL_AGE
-
-    def decide(self, observation: Observation) -> Action:
-        has_slow = False
-        for mobs in observation.machines.values():
-            is_dead  = (mobs.measured_speed < self.DEAD_SPEED_THRESHOLD
-                        or mobs.alive_signal_age > self.MAX_SIGNAL_AGE_S)
-            is_slow  = (mobs.normal_speed > 0
-                        and mobs.measured_speed / mobs.normal_speed < self.SLOW_RATIO_THRESHOLD
-                        and not is_dead)
-            if is_dead:
-                return Action.EVICT
-            if is_slow:
-                has_slow = True
-
-        if has_slow:
+    def decide(self, observation: Observation) -> PolicyOutput:
+        if any(is_dead(m) for m in observation.machines.values()):
+            return Action.EVICT
+        if shares_imbalanced(observation):
             return Action.REBALANCE
-
         return Action.WAIT
 
 
@@ -560,90 +746,30 @@ def run_episode(
     total_steps:    int,
 ) -> EpisodeResult:
     """
-    Run one full training episode.
+    Run one full training episode of `total_steps` ticks.
 
-    Parameters
-    ----------
-    cluster        : Fresh (or reset) SimulatedCluster instance.
-    policy         : Any BasePolicy subclass.
-    fault_schedule : Pre-built FaultSchedule (shared across all baseline runs
-                     so comparisons are fair - each run gets a fresh cluster).
-    total_steps    : Number of simulated training steps to execute.
-
-    Returns
-    -------
-    EpisodeResult with all goodput / cost / latency metrics.
+    Each tick: observe -> policy decides (timed) -> apply action -> one step.
+    All action semantics live in SimulatedCluster.apply_action.
     """
-
-    useful_steps:      int   = 0
-    wasted_time_s:     float = 0.0
-    work_lost:         int   = 0
     decision_times_ms: List[float] = []
     decision_counts:   Dict[str, int] = {a.name: 0 for a in Action}
 
     # Issue an initial checkpoint so RESTART has a valid rollback point.
     cluster.apply_checkpoint()
+    cluster.fire_due_faults(fault_schedule)
 
-    steps_done = 0
-    while steps_done < total_steps:
-
-        # 1. Gather observation
+    for _ in range(total_steps):
         obs = cluster.get_observation()
 
-        # 2. Policy decides (timed)
         t0 = time.perf_counter()
-        action = policy.decide(obs)
-        decision_ms = (time.perf_counter() - t0) * 1_000
-        decision_times_ms.append(decision_ms)
+        action, target = _unpack(policy.decide(obs))
+        decision_times_ms.append((time.perf_counter() - t0) * 1_000)
         decision_counts[action.name] += 1
 
-        # 3. Apply action
-        if action == Action.WAIT:
-            pass   # Intentional no-op
+        cluster.apply_action(action, target)
+        cluster.step_forward(fault_schedule)
 
-        elif action == Action.EVICT:
-            # Evict the first dead machine found in the observation
-            for mid, mobs in obs.machines.items():
-                is_dead = (mobs.measured_speed < RebalanceOnlyPolicy.DEAD_SPEED_THRESHOLD
-                           or mobs.alive_signal_age > SimulatedCluster.CRASH_SIGNAL_AGE)
-                if is_dead:
-                    cluster.apply_evict(mid)
-                    break   # Evict one machine per step
-
-        elif action == Action.REBALANCE:
-            cluster.apply_rebalance()
-
-        elif action == Action.COMPENSATE:
-            # COMPENSATE: reduce the share of slow machines, pushing more to fast ones
-            cluster.apply_rebalance()
-
-        elif action == Action.READMIT:
-            # Re-admit any evicted machines that might have recovered
-            for mid, mobs in obs.machines.items():
-                if mobs.alive_signal_age < SimulatedCluster.HEARTBEAT_INTERVAL_S * 2:
-                    cluster.apply_readmit(mid)
-
-        elif action == Action.RESTART:
-            lost = cluster.apply_restart()
-            work_lost    += lost
-            wasted_time_s += lost / 5.0   # Rough: ~5 steps/sec average speed
-            steps_done += 1
-            continue   # Skip step_forward for this iteration
-
-        elif action == Action.CHECKPOINT:
-            cluster.apply_checkpoint()
-
-        # 4. Advance the cluster one step
-        step_useful, step_duration = cluster.step_forward(fault_schedule)
-
-        if step_useful:
-            useful_steps += 1
-        else:
-            wasted_time_s += step_duration
-
-        steps_done += 1
-
-    # 5. Compute final metrics
+    useful_steps   = cluster.train_step
     total_time_s   = cluster.sim_time
     total_cost_usd = cluster.total_cost_so_far()
 
@@ -654,14 +780,14 @@ def run_episode(
 
     return EpisodeResult(
         policy_name         = policy.name,
-        total_steps         = steps_done,
+        total_steps         = total_steps,
         useful_steps        = useful_steps,
         total_time_s        = total_time_s,
         total_cost_usd      = total_cost_usd,
         goodput_per_hr      = goodput_per_hr,
         goodput_per_usd     = goodput_per_usd,
-        total_wasted_time_s = wasted_time_s,
-        work_lost           = work_lost,
+        total_wasted_time_s = cluster.wasted_time_s,
+        work_lost           = cluster.work_lost,
         avg_decision_ms     = avg_decision_ms,
         decisions           = {k: v for k, v in decision_counts.items() if v > 0},
     )
@@ -751,114 +877,103 @@ class RandomFaultGenerator:
 
 class OraclePolicy(BasePolicy):
     """
-    Cheating oracle – peeks at the future fault schedule.
+    Perfect-information planner – knows the whole fault schedule.
 
     Decision rules
     --------------
-    * Upcoming crash           → EVICT (proactive)
-    * Upcoming long slowdown   (>= long_threshold steps) → COMPENSATE
-    * Upcoming medium slowdown → REBALANCE
-    * Upcoming short slowdown  (< short_threshold steps) → WAIT
-    * No upcoming fault        → WAIT
-
-    The look-ahead window is `horizon_steps` into the future.
+    * A machine has crashed (by the schedule) and is still in the ring -> EVICT it
+      at once (no heartbeat timeout needed).
+    * Otherwise the current situation lasts R more ticks: until the next fault
+      starts or an active slowdown ends (capped at HORIZON). For every valid
+      action, cost = overhead + R * step_time_after. Pick the cheapest; WAIT
+      wins ties.
     """
     name = "OraclePolicy"
 
-    SHORT_THRESHOLD:  int = 30    # steps; below this → WAIT
-    LONG_THRESHOLD:   int = 120   # steps; above this → COMPENSATE
-    HORIZON:          int = 50    # how many future steps to inspect
+    HORIZON: int = 300    # cap on how far ahead one decision has to pay off
 
-    def __init__(self, fault_generator: any):
+    def __init__(self, fault_generator: object):
         self._gen = fault_generator
 
     @property
     def events(self) -> List[FaultEvent]:
         if hasattr(self._gen, "events"):
             return self._gen.events
-        elif hasattr(self._gen, "_events"):
-            return self._gen._events
         elif isinstance(self._gen, list):
             return self._gen
         return []
 
-    def decide(self, observation: Observation) -> Action:
-        current_step = observation.step
-        horizon_end  = current_step + self.HORIZON
+    def _ticks_until_change(self, tick: int) -> int:
+        changes = [tick + self.HORIZON]
+        for e in self.events:
+            if e.step > tick:
+                changes.append(e.step)
+            elif e.kind == "slowdown" and e.step + e.duration_steps > tick:
+                changes.append(e.step + e.duration_steps)
+        return max(1, min(changes) - tick)
 
-        # Scan upcoming events in the look-ahead window
-        for event in self.events:
-            if not (current_step <= event.step < horizon_end):
-                continue
-            if event.kind == "crash":
-                return Action.EVICT
-            if event.kind == "slowdown":
-                if event.duration_steps >= self.LONG_THRESHOLD:
-                    return Action.COMPENSATE
-                if event.duration_steps >= self.SHORT_THRESHOLD:
-                    return Action.REBALANCE
-                # Short slowdown → ride it out
-                return Action.WAIT
+    def decide(self, observation: Observation) -> PolicyOutput:
+        tick = observation.step
+        machines = observation.machines
 
-        return Action.WAIT
+        for e in self.events:
+            if (e.kind == "crash" and e.step <= tick
+                    and e.machine_id in machines and not machines[e.machine_id].evicted):
+                return (Action.EVICT, e.machine_id)
+
+        crashed = {e.machine_id for e in self.events if e.kind == "crash" and e.step <= tick}
+        R = self._ticks_until_change(tick)
+
+        candidates: List[Tuple[Action, Optional[str]]] = [(Action.WAIT, None), (Action.REBALANCE, None)]
+        for mid, m in machines.items():
+            if m.is_active:
+                candidates.append((Action.COMPENSATE, mid))
+                candidates.append((Action.EVICT, mid))
+            elif m.evicted and mid not in crashed:
+                candidates.append((Action.READMIT, mid))
+
+        best, best_cost = (Action.WAIT, None), math.inf
+        for action, target in candidates:
+            overhead, st = plan_action(observation, action, target)
+            cost = overhead + R * st
+            if cost < best_cost - 1e-9:
+                best, best_cost = (action, target), cost
+        return best
 
 
 class TimeDelayedPolicy(BasePolicy):
     """
-    Waits `wait_steps` (or `wait_time`) after first detecting a slowdown before acting.
+    Waits `wait_steps` ticks after the split first becomes imbalanced (a machine
+    slowed down or recovered) before acting. Dead machines are evicted at once.
 
     State machine
     -------------
-    NORMAL  → sees a slow machine → record step + enter WATCHING
-    WATCHING→ if slowdown persists past wait_steps → enter ACTING → REBALANCE
-    ACTING  → keeps returning REBALANCE until the cluster looks normal again
-             → then reset to NORMAL
+    NORMAL   → split goes off → record tick + enter WATCHING
+    WATCHING → still off after wait_steps → REBALANCE
+    any time the split is fine again → reset to NORMAL
     """
-
-    DEAD_SPEED_THRESHOLD: float = 0.01
-    SLOW_RATIO_THRESHOLD: float = 0.65
 
     def __init__(self, wait_steps: int = 60, wait_time: Optional[int] = None):
         if wait_time is not None:
             wait_steps = wait_time
-        self._wait_steps     = wait_steps
-        self._wait_time      = wait_steps
-        self._detect_step: Optional[int] = None   # step at which slowdown first noticed
-        self._detect_time: Optional[float] = None # sim_time at which slowdown first noticed
+        self._wait_steps = wait_steps
+        self._detect_step: Optional[int] = None   # tick at which imbalance first noticed
         self.name = f"TimeDelayedPolicy(wait={wait_steps})"
 
-    def decide(self, observation: Observation) -> Action:
-        # Detect whether any machine is currently slow or dead
-        slow_or_dead = False
-        dead         = False
-        for mobs in observation.machines.values():
-            if mobs.measured_speed < self.DEAD_SPEED_THRESHOLD or mobs.alive_signal_age > SimulatedCluster.CRASH_SIGNAL_AGE:
-                dead = slow_or_dead = True
-            elif (mobs.normal_speed > 0
-                  and mobs.measured_speed / mobs.normal_speed < self.SLOW_RATIO_THRESHOLD):
-                slow_or_dead = True
-
-        if dead:
+    def decide(self, observation: Observation) -> PolicyOutput:
+        if any(is_dead(m) for m in observation.machines.values()):
             self._detect_step = None
-            self._detect_time = None
             return Action.EVICT
 
-        if not slow_or_dead:
-            self._detect_step = None   # cluster recovered
-            self._detect_time = None
+        if not shares_imbalanced(observation):
+            self._detect_step = None   # cluster balanced again
             return Action.WAIT
 
-        # First detection of slowdown
         if self._detect_step is None:
             self._detect_step = observation.step
-            self._detect_time = observation.time
             return Action.WAIT
 
-        # Check whether wait window has elapsed (supports both steps and time)
-        steps_waiting = observation.step - self._detect_step
-        time_waiting = observation.time - (self._detect_time if self._detect_time is not None else 0.0)
-        effective_waiting = max(steps_waiting, time_waiting)
-        if effective_waiting >= self._wait_steps:
+        if observation.step - self._detect_step >= self._wait_steps:
             return Action.REBALANCE
 
         return Action.WAIT   # still inside patience window
@@ -872,13 +987,14 @@ class ClusterEnv:
     """
     OpenAI-Gym-style wrapper around SimulatedCluster.
 
-    Reward
-    ------
-    r_t = goodput_per_usd(t) - goodput_per_usd(t-1)
+    Reward (per tick)
+    -----------------
+    r_t = Δtrain_steps − HEALTHY_RATE · Δtime_s − cost_weight · Δcost_usd
 
-    A positive reward means the action improved efficiency per dollar.
-    A zero reward (WAIT on a healthy cluster) is neutral.
-    A negative reward means the action degraded efficiency.
+    HEALTHY_RATE is the steps/second of the healthy cluster, so a normal step
+    earns about 0, a slow step or an action overhead earns less than 0, and a
+    RESTART loses every rolled-back step. Summed over an episode this is
+    (goodput − ideal goodput), which is what we want to maximise.
 
     Usage
     -----
@@ -895,16 +1011,17 @@ class ClusterEnv:
         self,
         fault_generator: Optional[RandomFaultGenerator] = None,
         total_steps:    int = 1000,
+        cost_weight:    float = 0.0,
     ):
         if fault_generator is None:
             fault_generator = RandomFaultGenerator(seed=0, total_steps=total_steps)
         self._gen         = fault_generator
         self._total_steps = total_steps
+        self._cost_weight = cost_weight
         self._cluster:    Optional[SimulatedCluster] = None
         self._schedule:   Optional[FaultSchedule]   = None
-        self._steps_done: int   = 0
-        self._prev_gput_usd: float = 0.0
-        self._useful_steps:  int   = 0
+        self._steps_done: int = 0
+        self._healthy_rate: float = 0.0
 
     def reset(self, seed: int = 0) -> Observation:
         """Reset the environment and return the first observation."""
@@ -913,63 +1030,39 @@ class ClusterEnv:
         self._schedule   = new_gen.as_schedule()
         self._cluster    = SimulatedCluster(seed=seed)
         self._cluster.apply_checkpoint()
+        self._cluster.fire_due_faults(self._schedule)
         self._steps_done = 0
-        self._prev_gput_usd = 0.0
-        self._useful_steps  = 0
+        self._healthy_rate = sum(m.normal_speed for m in self._cluster.machines.values())
         return self._cluster.get_observation()
 
-    def step(self, action: Action) -> Tuple[Observation, float, bool, dict]:
+    def step(self, action: PolicyOutput) -> Tuple[Observation, float, bool, dict]:
         """
-        Apply `action`, advance one step.
+        Apply `action`, advance one tick.
 
         Returns
         -------
         obs    : new Observation
-        reward : delta goodput-per-dollar
+        reward : see class docstring
         done   : True when episode is finished
         info   : diagnostic dict
         """
-        assert self._cluster is not None, "Call reset() before step()."
+        assert self._cluster is not None and self._schedule is not None, "Call reset() before step()."
+        c = self._cluster
+        progress0, time0, cost0 = c.train_step, c.sim_time, c.total_cost_so_far()
 
-        # Apply action (same logic as run_episode)
-        work_lost = 0
-        if action == Action.EVICT:
-            obs_now = self._cluster.get_observation()
-            for mid, mobs in obs_now.machines.items():
-                if (mobs.measured_speed < 0.01
-                        or mobs.alive_signal_age > SimulatedCluster.CRASH_SIGNAL_AGE):
-                    self._cluster.apply_evict(mid)
-                    break
-        elif action in (Action.REBALANCE, Action.COMPENSATE):
-            self._cluster.apply_rebalance()
-        elif action == Action.RESTART:
-            work_lost = self._cluster.apply_restart()
-        elif action == Action.CHECKPOINT:
-            self._cluster.apply_checkpoint()
-        elif action == Action.READMIT:
-            obs_now = self._cluster.get_observation()
-            for mid, mobs in obs_now.machines.items():
-                if mobs.alive_signal_age < SimulatedCluster.HEARTBEAT_INTERVAL_S * 2:
-                    self._cluster.apply_readmit(mid)
-        # WAIT → no-op
-
-        # Advance simulation
-        assert self._schedule is not None
-        useful, _ = self._cluster.step_forward(self._schedule)
-        if useful:
-            self._useful_steps += 1
+        act, target = _unpack(action)
+        info_action = c.apply_action(act, target)
+        c.step_forward(self._schedule)
         self._steps_done += 1
 
-        # Compute reward = delta goodput/$
-        cost = self._cluster.total_cost_so_far()
-        cur_gput_usd = (self._useful_steps / cost) if cost > 0 else 0.0
-        reward = float(cur_gput_usd - self._prev_gput_usd)
-        self._prev_gput_usd = cur_gput_usd
+        reward = ((c.train_step - progress0)
+                  - self._healthy_rate * (c.sim_time - time0)
+                  - self._cost_weight * (c.total_cost_so_far() - cost0))
 
         done = bool(self._steps_done >= self._total_steps)
-        obs  = self._cluster.get_observation()
-        info = {"work_lost": int(work_lost), "useful_steps": int(self._useful_steps)}
-        return obs, reward, done, info
+        obs  = c.get_observation()
+        info = {"work_lost": int(info_action["steps_lost"]), "useful_steps": int(c.train_step)}
+        return obs, float(reward), done, info
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1002,6 +1095,24 @@ class SweepStats:
         )
 
 
+def _mean(lst: List[float]) -> float:
+    return sum(lst) / len(lst)
+
+
+def _std_fallback(lst: List[float]) -> float:
+    """Sample standard deviation (ddof=1)."""
+    if len(lst) <= 1:
+        return 0.0
+    m = sum(lst) / len(lst)
+    return math.sqrt(sum((x - m) ** 2 for x in lst) / (len(lst) - 1))
+
+
+def _finite_gput_usd(result: EpisodeResult) -> float:
+    # Replace inf (nothing billed) with a large finite number so stats work
+    return (result.goodput_per_usd if result.goodput_per_usd != float("inf")
+            else result.useful_steps / 1e-9)
+
+
 class ExperimentRunner:
     """
     Runs a policy across `n_seeds` independent episodes and aggregates stats.
@@ -1024,50 +1135,36 @@ class ExperimentRunner:
             pass a lambda: e.g. ``lambda _: DoNothingPolicy()``.
         policy_name    : display name (falls back to policy.name attribute).
         """
-        gput_hrs:    List[float] = []
-        gput_usds:   List[float] = []
-        wasted_ts:   List[float] = []
-        works_lost:  List[float] = []
+        gput_hrs:   List[float] = []
+        gput_usds:  List[float] = []
+        wasted_ts:  List[float] = []
+        works_lost: List[float] = []
+        name = policy_name or ""
 
         for seed in range(self._n_seeds):
             gen      = RandomFaultGenerator(seed=seed, total_steps=self._total_steps)
             schedule = gen.as_schedule()
             cluster  = SimulatedCluster(seed=seed)
             policy   = policy_factory(gen)
+            name     = name or policy.name
 
             result = run_episode(cluster, policy, schedule, self._total_steps)
 
             gput_hrs.append(result.goodput_per_hr)
-            # Replace inf with a large finite number so stats work
-            gput_usds.append(
-                result.goodput_per_usd if result.goodput_per_usd != float("inf")
-                else result.useful_steps / 1e-9
-            )
+            gput_usds.append(_finite_gput_usd(result))
             wasted_ts.append(result.total_wasted_time_s)
             works_lost.append(float(result.work_lost))
-
-        name = policy_name or ""
-
-        if _NUMPY_OK:
-            def _mean(lst): return float(np.mean(lst))
-            def _std(lst):  return float(np.std(lst, ddof=1)) if len(lst) > 1 else 0.0
-        else:
-            def _mean(lst): return sum(lst) / len(lst)
-            def _std(lst):
-                if len(lst) <= 1: return 0.0
-                m = sum(lst) / len(lst)
-                return math.sqrt(sum((x - m)**2 for x in lst) / (len(lst) - 1))
 
         return SweepStats(
             policy_name        = name,
             mean_goodput_hr    = _mean(gput_hrs),
-            std_goodput_hr     = _std(gput_hrs),
+            std_goodput_hr     = _std_fallback(gput_hrs),
             mean_goodput_usd   = _mean(gput_usds),
-            std_goodput_usd    = _std(gput_usds),
+            std_goodput_usd    = _std_fallback(gput_usds),
             mean_wasted_time_s = _mean(wasted_ts),
-            std_wasted_time_s  = _std(wasted_ts),
+            std_wasted_time_s  = _std_fallback(wasted_ts),
             mean_work_lost     = _mean(works_lost),
-            std_work_lost      = _std(works_lost),
+            std_work_lost      = _std_fallback(works_lost),
             n_seeds            = self._n_seeds,
         )
 
@@ -1076,12 +1173,36 @@ class ExperimentRunner:
 # §12 DAYS 5-6 – SWEEP PLOTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _std_fallback(lst: List[float]) -> float:
-    """Pure-Python population std-dev (ddof=1)."""
-    if len(lst) <= 1:
-        return 0.0
-    m = sum(lst) / len(lst)
-    return math.sqrt(sum((x - m) ** 2 for x in lst) / (len(lst) - 1))
+class _ShortBiasedFaultGen(RandomFaultGenerator):
+    """Re-generates events so that a given fraction of slowdowns are 'short'."""
+    def __init__(self, seed: int, total_steps: int, short_frac: float):
+        self._short_frac = short_frac
+        super().__init__(seed=seed, total_steps=total_steps)
+
+    def _generate(self) -> None:
+        super()._generate()
+        for ev in self._events:
+            if ev.kind == "slowdown":
+                ev.duration_steps = 10 if self._rng.random() < self._short_frac else 300
+
+
+class _OnSlowPolicy(BasePolicy):
+    """Plot-2 strategy: use `action` on a slow machine; re-split / readmit once it recovers."""
+    def __init__(self, action: Action):
+        self._action = action
+        self.name = f"{action.name}OnSlow"
+
+    def decide(self, obs: Observation) -> PolicyOutput:
+        for mid, m in obs.machines.items():
+            if is_dead(m):
+                return (Action.EVICT, mid)
+            if is_readmittable(m):
+                return (Action.READMIT, mid)
+            if is_slow(m) and not (self._action == Action.COMPENSATE and m.compensated):
+                return (self._action, mid)
+        if shares_imbalanced(obs):
+            return Action.REBALANCE
+        return Action.WAIT
 
 
 def run_final_evaluations(
@@ -1094,12 +1215,12 @@ def run_final_evaluations(
 
     plot1_wait_vs_act.png
         X-axis : share of slowdown events that are "short" (0 % – 100 %).
-        Y-axis : average Goodput/$.
-        Lines  : TimeDelayedPolicy(10), TimeDelayedPolicy(60), OraclePolicy.
+        Y-axis : average Goodput/hr.
+        Lines  : RebalanceOnly (act at once), TimeDelayed(10), TimeDelayed(60), Oracle.
 
     plot2_evict_vs_rebalance.png
-        Compares Goodput/$ for EVICT / REBALANCE / COMPENSATE strategies when
-        facing a severe 300-step slowdown.
+        Goodput/hr for EVICT / REBALANCE / COMPENSATE strategies when facing a
+        severe 300-step slowdown.
     """
 
     if not _MPL_OK:
@@ -1112,48 +1233,22 @@ def run_final_evaluations(
     short_fracs = [0.0, 0.25, 0.50, 0.75, 1.0]   # fraction of throttles that are short
 
     policy_configs = [
-        ("TimeDelayed(10s)",  lambda gen: TimeDelayedPolicy(wait_steps=10)),
-        ("TimeDelayed(60s)",  lambda gen: TimeDelayedPolicy(wait_steps=60)),
-        ("OraclePolicy",      lambda gen: OraclePolicy(gen)),
+        ("Act at once",              lambda gen: RebalanceOnlyPolicy()),
+        ("Wait 10 steps, then act",  lambda gen: TimeDelayedPolicy(wait_steps=10)),
+        ("Wait 60 steps, then act",  lambda gen: TimeDelayedPolicy(wait_steps=60)),
+        ("Oracle (knows the future)", lambda gen: OraclePolicy(gen)),
     ]
 
-    # We approximate "short-fraction" by controlling the duration_steps
-    # distribution inside a custom fault generator variant.
-    class _ShortBiasedFaultGen(RandomFaultGenerator):
-        """Re-generates events so that a given fraction of slowdowns are 'short'."""
-        def __init__(self, seed: int, total_steps: int, short_frac: float):
-            self._short_frac  = short_frac
-            super().__init__(seed=seed, total_steps=total_steps)
-
-        def _generate(self) -> None:
-            # Call parent generator first to populate crash event.
-            super()._generate()
-            # Rewrite the slowdown durations according to the short_frac.
-            for ev in self._events:
-                if ev.kind == "slowdown":
-                    if self._rng.random() < self._short_frac:
-                        ev.duration_steps = 10    # short
-                    else:
-                        ev.duration_steps = 300   # long
-
     results_p1: Dict[str, List[float]] = {name: [] for name, _ in policy_configs}
-
     for sf in short_fracs:
         for pol_name, pol_factory in policy_configs:
             vals: List[float] = []
             for seed in range(n_seeds):
-                gen      = _ShortBiasedFaultGen(seed=seed, total_steps=total_steps,
-                                                short_frac=sf)
-                schedule = gen.as_schedule()
-                cluster  = SimulatedCluster(seed=seed)
-                policy   = pol_factory(gen)
-                result   = run_episode(cluster, policy, schedule, total_steps)
-                gput = (result.goodput_per_usd
-                        if result.goodput_per_usd != float("inf")
-                        else result.useful_steps / 1e-9)
-                vals.append(gput)
-            mean_gput = sum(vals) / len(vals)
-            results_p1[pol_name].append(mean_gput)
+                gen      = _ShortBiasedFaultGen(seed=seed, total_steps=total_steps, short_frac=sf)
+                result   = run_episode(SimulatedCluster(seed=seed), pol_factory(gen),
+                                       gen.as_schedule(), total_steps)
+                vals.append(result.goodput_per_hr)
+            results_p1[pol_name].append(_mean(vals))
 
     fig1, ax1 = plt.subplots(figsize=(8, 5))
     markers = ["o", "s", "^", "D"]
@@ -1167,7 +1262,7 @@ def run_final_evaluations(
             label=pol_name,
         )
     ax1.set_xlabel("Short-lived slowdown share (%)", fontsize=12)
-    ax1.set_ylabel("Goodput / $ (steps per dollar)", fontsize=12)
+    ax1.set_ylabel("Goodput / hr (training steps per hour)", fontsize=12)
     ax1.set_title("Wait vs Act: Effect of Slowdown Duration Mix", fontsize=14)
     ax1.legend(fontsize=10)
     ax1.grid(True, linestyle="--", alpha=0.5)
@@ -1178,95 +1273,45 @@ def run_final_evaluations(
     print(f"  [Plot 1] Saved -> {p1_path}")
 
     # ── PLOT 2: Evict vs Rebalance vs Compensate (300-step slowdown) ──────────
-    class _Severe300SlowdownSchedule(FaultSchedule):
-        """A fixed schedule with one 300-step 40% slowdown on win-gpu-0 at step 50."""
-        def __init__(self):
-            super().__init__(events=[
-                FaultEvent(
-                    step=50, machine_id="win-gpu-0",
-                    kind="slowdown",
-                    slowdown_fraction=0.40,
-                    duration_steps=300,
-                ),
-            ])
-
-    class _EvictOnSlowPolicy(BasePolicy):
-        name = "EvictOnSlow"
-        SLOW_RATIO = 0.65
-        def decide(self, obs: Observation) -> Action:
-            for mobs in obs.machines.values():
-                if (mobs.normal_speed > 0
-                        and mobs.measured_speed / mobs.normal_speed < self.SLOW_RATIO
-                        and mobs.measured_speed > 0.01):
-                    return Action.EVICT
-            return Action.WAIT
-
-    class _RebalanceOnSlowPolicy(BasePolicy):
-        name = "RebalanceOnSlow"
-        SLOW_RATIO = 0.65
-        def decide(self, obs: Observation) -> Action:
-            for mobs in obs.machines.values():
-                if (mobs.normal_speed > 0
-                        and mobs.measured_speed / mobs.normal_speed < self.SLOW_RATIO
-                        and mobs.measured_speed > 0.01):
-                    return Action.REBALANCE
-            return Action.WAIT
-
-    class _CompensateOnSlowPolicy(BasePolicy):
-        name = "CompensateOnSlow"
-        SLOW_RATIO = 0.65
-        def decide(self, obs: Observation) -> Action:
-            for mobs in obs.machines.values():
-                if (mobs.normal_speed > 0
-                        and mobs.measured_speed / mobs.normal_speed < self.SLOW_RATIO
-                        and mobs.measured_speed > 0.01):
-                    return Action.COMPENSATE
-            return Action.WAIT
+    def severe_schedule() -> FaultSchedule:
+        """One 300-step 40% slowdown on win-gpu-0 at step 50."""
+        return FaultSchedule(events=[FaultEvent(
+            step=50, machine_id="win-gpu-0", kind="slowdown",
+            slowdown_fraction=0.40, duration_steps=300,
+        )])
 
     p2_policies = [
-        ("EVICT",       _EvictOnSlowPolicy()),
-        ("REBALANCE",   _RebalanceOnSlowPolicy()),
-        ("COMPENSATE",  _CompensateOnSlowPolicy()),
+        ("WAIT",       lambda: DoNothingPolicy()),
+        ("EVICT",      lambda: _OnSlowPolicy(Action.EVICT)),
+        ("REBALANCE",  lambda: _OnSlowPolicy(Action.REBALANCE)),
+        ("COMPENSATE", lambda: _OnSlowPolicy(Action.COMPENSATE)),
     ]
 
     bar_means: List[float] = []
-    bar_stds:  List[float] = []
     bar_labels: List[str]  = []
-
-    for pol_label, policy in p2_policies:
-        vals = []
-        for seed in range(n_seeds):
-            sched   = _Severe300SlowdownSchedule()
-            cluster = SimulatedCluster(seed=seed)
-            result  = run_episode(cluster, policy, sched, total_steps)
-            gput = (result.goodput_per_usd
-                    if result.goodput_per_usd != float("inf")
-                    else result.useful_steps / 1e-9)
-            vals.append(gput)
-        bar_means.append(sum(vals) / len(vals))
-        bar_stds.append(_std_fallback(vals))
+    for pol_label, make in p2_policies:
+        # The scenario is deterministic, so one run per strategy is exact.
+        result = run_episode(SimulatedCluster(seed=0), make(), severe_schedule(), total_steps)
+        bar_means.append(result.goodput_per_hr)
         bar_labels.append(pol_label)
 
     fig2, ax2 = plt.subplots(figsize=(7, 5))
     x_pos  = list(range(len(bar_labels)))
-    colors = ["#e07b54", "#54a8e0", "#54e09e"]
+    colors = ["#9e9e9e", "#e07b54", "#54a8e0", "#54e09e"]
     bars = ax2.bar(
-        x_pos, bar_means, yerr=bar_stds,
+        x_pos, bar_means,
         color=colors[:len(bar_labels)],
-        capsize=6, width=0.5, edgecolor="black", linewidth=0.8,
+        width=0.5, edgecolor="black", linewidth=0.8,
     )
     ax2.set_xticks(x_pos)
     ax2.set_xticklabels(bar_labels, fontsize=12)
-    ax2.set_ylabel("Goodput / $ (steps per dollar)", fontsize=12)
+    ax2.set_ylabel("Goodput / hr (training steps per hour)", fontsize=12)
     ax2.set_title("Compensate vs Evict: 300-step 40% Slowdown", fontsize=14)
+    ax2.set_ylim(0, max(bar_means) * 1.08)
     ax2.grid(True, axis="y", linestyle="--", alpha=0.5)
     for bar, mean in zip(bars, bar_means):
-        ax2.text(
-            bar.get_x() + bar.get_width() / 2,
-            bar.get_height() + max(bar_stds) * 0.05,
-            f"{mean:.0f}",
-            ha="center", va="bottom", fontsize=10,
-        )
+        ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                 f"{mean:.0f}", ha="center", va="bottom", fontsize=10)
     fig2.tight_layout()
     p2_path = os.path.join(output_dir, "plot2_evict_vs_rebalance.png")
     fig2.savefig(p2_path, dpi=150)
@@ -1300,6 +1345,7 @@ if __name__ == "__main__":
         DoNothingPolicy(),
         AlwaysRestartPolicy(),
         RebalanceOnlyPolicy(),
+        OraclePolicy(smoke_schedule),
     ]
     smoke_results: List[EpisodeResult] = []
     for pol in smoke_policies:
@@ -1338,7 +1384,7 @@ if __name__ == "__main__":
         ("DoNothingPolicy",       lambda _: DoNothingPolicy()),
         ("AlwaysRestartPolicy",   lambda _: AlwaysRestartPolicy()),
         ("RebalanceOnlyPolicy",   lambda _: RebalanceOnlyPolicy()),
-        ("TimeDelayed(60s)",      lambda _: TimeDelayedPolicy(wait_steps=60)),
+        ("TimeDelayed(60 steps)", lambda _: TimeDelayedPolicy(wait_steps=60)),
         ("OraclePolicy",          lambda gen: OraclePolicy(gen)),
     ]
 
@@ -1351,9 +1397,8 @@ if __name__ == "__main__":
 
     print()
 
-    # Pretty-print Day 7 table
     hdr_cols = ["Policy", "Goodput/hr (avg+/-std)", "Goodput/$ (avg+/-std)",
-                "Cost/episode ($)", "Work Lost (steps)"]
+                "Wasted time (s)", "Work Lost (steps)"]
     cw = [30, 26, 26, 18, 20]
 
     def _row(*cells) -> str:
@@ -1366,10 +1411,8 @@ if __name__ == "__main__":
     print("-" * sum(cw))
 
     for st in sweep_stats:
-        ghr  = f"{st.mean_goodput_hr:.1f} +/- {st.std_goodput_hr:.1f}"
-        gusd = f"{st.mean_goodput_usd:.1f} +/- {st.std_goodput_usd:.1f}"
-        # Approximate cost: from total_time & machine prices – not stored in
-        # SweepStats, so we note "see EpisodeResult" for detailed per-run cost.
+        ghr    = f"{st.mean_goodput_hr:.1f} +/- {st.std_goodput_hr:.1f}"
+        gusd   = f"{st.mean_goodput_usd:.1f} +/- {st.std_goodput_usd:.1f}"
         wasted = f"{st.mean_wasted_time_s:.1f} s"
         lost   = f"{st.mean_work_lost:.1f} +/- {st.std_work_lost:.1f}"
         print(_row(st.policy_name, ghr, gusd, wasted, lost))
@@ -1387,4 +1430,3 @@ if __name__ == "__main__":
     print("  All done.")
     if _MPL_OK:
         print("  Plots saved to:", os.path.abspath(OUT_DIR))
-

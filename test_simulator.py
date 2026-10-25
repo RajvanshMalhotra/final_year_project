@@ -26,7 +26,10 @@ from typing import Dict, List
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from simulator import (
+    ACTION_OVERHEAD_S,
+    CRASH_SIGNAL_AGE_S,
     Action,
+    AlwaysRestartPolicy,
     BasePolicy,
     ClusterEnv,
     DoNothingPolicy,
@@ -39,6 +42,8 @@ from simulator import (
     RebalanceOnlyPolicy,
     SimulatedCluster,
     TimeDelayedPolicy,
+    plan_action,
+    run_episode,
 )
 
 
@@ -348,66 +353,35 @@ class TestAdvancedPolicies(unittest.TestCase):
     def test_oracle_policy_short_vs_long_slowdowns(self) -> None:
         """
         Test OraclePolicy:
-        Feed an observation to OraclePolicy where a short 5-second slowdown is scheduled.
-        Assert it returns WAIT.
-        Feed a different schedule with a 300-second slowdown.
-        Assert it returns COMPENSATE or REBALANCE.
+        While a short 5-step slowdown is in effect, acting costs more than it saves -> WAIT.
+        While a 300-step slowdown is in effect, acting pays off -> COMPENSATE or REBALANCE.
+        (The Oracle now acts on the tick a fault starts; faults are visible on that tick.)
         """
-        healthy_obs = Observation(
-            time=0.0,
-            step=0,
-            machines={
-                "mac-m2": MachineObs(0.1, 1.2, 1.2, 0.15, "v1.0", 0.0, True),
-                "win-gpu-0": MachineObs(0.1, 3.5, 3.5, 0.425, "v1.0", 0.5, True),
-                "win-gpu-1": MachineObs(0.1, 3.5, 3.5, 0.425, "v1.0", 0.5, True),
-            },
-        )
+        for duration, allowed in ((5, [Action.WAIT]),
+                                  (300, [Action.COMPENSATE, Action.REBALANCE])):
+            schedule = FaultSchedule([
+                FaultEvent(
+                    step=2,
+                    machine_id="win-gpu-0",
+                    kind="slowdown",
+                    slowdown_fraction=0.40,
+                    duration_steps=duration,
+                )
+            ])
+            obs = self._create_observation(step=2, sim_time=0.3, slowdown_ratio=0.60)
+            action = OraclePolicy(schedule).decide(obs)
+            action = action[0] if isinstance(action, tuple) else action
+            self.assertIn(action, allowed, f"{duration}-step slowdown: got {action}")
 
-        # 1. Short 5-second / 5-step slowdown scheduled at step 2
-        short_schedule = FaultSchedule([
-            FaultEvent(
-                step=2,
-                machine_id="win-gpu-0",
-                kind="slowdown",
-                slowdown_fraction=0.40,
-                duration_steps=5,
-            )
-        ])
-        oracle_short = OraclePolicy(short_schedule)
-        action_short = oracle_short.decide(healthy_obs)
-        self.assertEqual(
-            action_short,
-            Action.WAIT,
-            f"OraclePolicy should ride out short slowdowns (< 30 steps) with WAIT, got {action_short}",
-        )
-
-        # 2. Long 300-second / 300-step slowdown scheduled at step 2
-        long_schedule = FaultSchedule([
-            FaultEvent(
-                step=2,
-                machine_id="win-gpu-0",
-                kind="slowdown",
-                slowdown_fraction=0.40,
-                duration_steps=300,
-            )
-        ])
-        oracle_long = OraclePolicy(long_schedule)
-        action_long = oracle_long.decide(healthy_obs)
-        self.assertIn(
-            action_long,
-            [Action.COMPENSATE, Action.REBALANCE],
-            f"OraclePolicy should act on long slowdowns with COMPENSATE or REBALANCE, got {action_long}",
-        )
-
-    def test_oracle_policy_proactively_evicts_on_crash(self) -> None:
-        """Assert OraclePolicy returns EVICT when a crash is scheduled ahead."""
+    def test_oracle_policy_evicts_on_crash(self) -> None:
+        """Assert OraclePolicy evicts a machine on the tick it crashes (no heartbeat wait)."""
         crash_schedule = FaultSchedule([
             FaultEvent(step=5, machine_id="win-gpu-1", kind="crash")
         ])
         oracle = OraclePolicy(crash_schedule)
-        obs = Observation(time=0.0, step=0, machines={})
-        action = oracle.decide(obs)
-        self.assertEqual(action, Action.EVICT, "OraclePolicy must return EVICT on upcoming crash.")
+        obs = self._create_observation(step=5, sim_time=0.6, slowdown_ratio=1.0)
+        self.assertEqual(oracle.decide(obs), (Action.EVICT, "win-gpu-1"),
+                         "OraclePolicy must EVICT the crashed machine at once.")
 
 
 class TestClusterEnvRLWrapper(unittest.TestCase):
@@ -478,20 +452,194 @@ class TestClusterEnvRLWrapper(unittest.TestCase):
         env_wait.step(Action.WAIT)
         env_reb.step(Action.WAIT)
 
-        # Step 1: Both clusters are now actively suffering the severe slowdown.
-        # Scenario A: Agent continues to WAIT (no adaptation)
-        _, reward_wait, _, _ = env_wait.step(Action.WAIT)
+        # Steps 1-19: both clusters suffer the slowdown.
+        # Scenario A: Agent keeps WAITing. Scenario B: REBALANCE once, then WAIT.
+        # REBALANCE costs time on the step it runs, so compare the reward summed
+        # over the slowdown, not a single step.
+        reward_wait = sum(env_wait.step(Action.WAIT)[1] for _ in range(19))
+        reward_rebalance = env_reb.step(Action.REBALANCE)[1]
+        reward_rebalance += sum(env_reb.step(Action.WAIT)[1] for _ in range(18))
 
-        # Scenario B: Agent takes Action.REBALANCE (adapts workload shares)
-        _, reward_rebalance, _, _ = env_reb.step(Action.REBALANCE)
-
-        # Assert REBALANCE achieves higher delta in Goodput/$
         self.assertGreater(
             reward_rebalance,
             reward_wait,
             f"REBALANCE reward ({reward_rebalance:.2f}) must exceed WAIT reward ({reward_wait:.2f}) "
             "during a severe slowdown.",
         )
+
+
+def _slowdown(step: int, machine_id: str = "win-gpu-0", frac: float = 0.40,
+              duration: int = 300) -> FaultEvent:
+    return FaultEvent(step=step, machine_id=machine_id, kind="slowdown",
+                      slowdown_fraction=frac, duration_steps=duration)
+
+
+def _crash(step: int, machine_id: str = "win-gpu-0") -> FaultEvent:
+    return FaultEvent(step=step, machine_id=machine_id, kind="crash")
+
+
+class TestCorrectnessFixes(unittest.TestCase):
+    """
+    §4b. Regression tests for the bugs found in the 2026-10-24 review.
+    Each test names the bug it guards against.
+    """
+
+    # Bug 1: the Oracle only looked at future events, so it never evicted a crashed machine.
+    def test_oracle_evicts_after_crash(self) -> None:
+        sched = FaultSchedule([_crash(100)])
+        r = run_episode(SimulatedCluster(seed=0), OraclePolicy(sched), sched, 300)
+        self.assertGreaterEqual(r.useful_steps, 295)
+
+    # Bug 2: EVICT only removed dead machines, so a slow machine could never be evicted.
+    def test_evict_removes_slow_machine_but_keeps_it_alive(self) -> None:
+        c = SimulatedCluster(seed=0)
+        c.inject_slowdown("win-gpu-0", 0.40, 300)
+        c.apply_action(Action.EVICT, "win-gpu-0")
+        m = c.machines["win-gpu-0"]
+        self.assertTrue(m.evicted)
+        self.assertTrue(m.alive, "Evicting is our decision, not a crash.")
+
+    # Bug 3: COMPENSATE ran exactly the same code as REBALANCE.
+    def test_compensate_beats_rebalance_on_step_time(self) -> None:
+        times = {}
+        for action in (Action.WAIT, Action.REBALANCE, Action.COMPENSATE):
+            c = SimulatedCluster(seed=0)
+            c.inject_slowdown("win-gpu-0", 0.40, 300)
+            c.apply_action(action, "win-gpu-0")
+            _, times[action] = c.step_forward(FaultSchedule())
+        self.assertLess(times[Action.REBALANCE], times[Action.WAIT])
+        self.assertLess(times[Action.COMPENSATE], times[Action.REBALANCE])
+
+    def test_actions_cost_time(self) -> None:
+        for action in (Action.REBALANCE, Action.COMPENSATE, Action.EVICT, Action.RESTART):
+            c = SimulatedCluster(seed=0)
+            c.inject_slowdown("win-gpu-0", 0.40, 300)
+            t0 = c.sim_time
+            c.apply_action(action, "win-gpu-0")
+            self.assertAlmostEqual(c.sim_time - t0, ACTION_OVERHEAD_S[action], places=6,
+                                   msg=f"{action.name} should cost its overhead")
+
+    def test_repeating_an_action_that_changes_nothing_is_free(self) -> None:
+        c = SimulatedCluster(seed=0)
+        c.inject_slowdown("win-gpu-0", 0.40, 300)
+        c.apply_action(Action.REBALANCE)
+        t0 = c.sim_time
+        c.apply_action(Action.REBALANCE)
+        self.assertEqual(c.sim_time, t0)
+
+    # Bug 4: RESTART was free and rolled-back steps still counted as useful.
+    def test_restart_rolls_back_progress_and_costs_time(self) -> None:
+        c = SimulatedCluster(seed=0, checkpoint_every=0)
+        c.apply_checkpoint()
+        for _ in range(50):
+            c.step_forward(FaultSchedule())
+        self.assertEqual(c.train_step, 50)
+        info = c.apply_action(Action.RESTART)
+        self.assertEqual(c.train_step, 0)
+        self.assertEqual(info["steps_lost"], 50)
+        self.assertGreater(c.wasted_time_s, ACTION_OVERHEAD_S[Action.RESTART])
+
+    def test_restart_policy_reports_net_progress(self) -> None:
+        sched = FaultSchedule([_crash(150)])
+        r = run_episode(SimulatedCluster(seed=0), AlwaysRestartPolicy(), sched, 300)
+        self.assertGreater(r.work_lost, 0)
+        self.assertLess(r.useful_steps, 300 - r.work_lost)
+
+    # Bug 5: faults were keyed on the training step, which rewinds on restart, so they replayed.
+    def test_fault_fires_once_even_after_rollback(self) -> None:
+        sched = FaultSchedule([_slowdown(5, duration=2)])
+        c = SimulatedCluster(seed=0, checkpoint_every=0)
+        c.apply_checkpoint()
+        for _ in range(8):
+            c.step_forward(sched)
+        c.apply_action(Action.RESTART)
+        for _ in range(8):
+            c.step_forward(sched)
+            self.assertEqual(c.machines["win-gpu-0"].measured_speed,
+                             c.machines["win-gpu-0"].normal_speed)
+
+    # Bug 6: every machine was billed for the whole episode, evicted or not.
+    def test_evicting_a_paid_gpu_lowers_the_bill(self) -> None:
+        def cost_rate(evict: bool) -> float:
+            c = SimulatedCluster(seed=0, checkpoint_every=0)
+            if evict:
+                c.apply_action(Action.EVICT, "win-gpu-0")
+            c0, t0 = c.total_cost_so_far(), c.sim_time
+            for _ in range(100):
+                c.step_forward(FaultSchedule())
+            return (c.total_cost_so_far() - c0) / (c.sim_time - t0)
+        self.assertLess(cost_rate(True), cost_rate(False))
+
+    # Bug 7: a 30% slowdown was invisible to the baselines (cutoff was 65% of normal speed).
+    def test_baseline_reacts_to_30pct_slowdown(self) -> None:
+        c = SimulatedCluster(seed=0)
+        c.inject_slowdown("win-gpu-0", 0.30, 300)
+        self.assertEqual(RebalanceOnlyPolicy().decide(c.get_observation()), Action.REBALANCE)
+
+    # Bug 8: an evicted machine looked dead forever, so policies kept evicting and READMIT never worked.
+    def test_evicted_machine_is_not_treated_as_dead(self) -> None:
+        c = SimulatedCluster(seed=0)
+        c.apply_action(Action.EVICT, "win-gpu-0")
+        self.assertEqual(RebalanceOnlyPolicy().decide(c.get_observation()), Action.WAIT)
+
+    def test_recovered_evicted_machine_can_be_readmitted(self) -> None:
+        c = SimulatedCluster(seed=0)
+        c.inject_slowdown("win-gpu-0", 0.40, 5)
+        c.apply_action(Action.EVICT, "win-gpu-0")
+        for _ in range(10):
+            c.step_forward(FaultSchedule())
+        c.apply_action(Action.READMIT, "win-gpu-0")
+        self.assertTrue(c.machines["win-gpu-0"].is_active)
+        self.assertGreater(c.machines["win-gpu-0"].share, 0.0)
+
+    def test_crashed_machine_cannot_be_readmitted(self) -> None:
+        c = SimulatedCluster(seed=0)
+        c.inject_crash("win-gpu-0")
+        c.apply_action(Action.EVICT, "win-gpu-0")
+        c.apply_action(Action.READMIT, "win-gpu-0")
+        self.assertFalse(c.machines["win-gpu-0"].is_active)
+
+    # Extra: a crash is only visible after the heartbeat times out (it was instant before).
+    def test_crash_detected_only_after_heartbeat_timeout(self) -> None:
+        sched = FaultSchedule([_crash(10)])
+        c = SimulatedCluster(seed=0)
+        for _ in range(11):
+            c.step_forward(sched)
+        self.assertFalse(RebalanceOnlyPolicy().decide(c.get_observation()) == Action.EVICT)
+        for _ in range(int(CRASH_SIGNAL_AGE_S) + 2):
+            c.step_forward(sched)
+        self.assertEqual(RebalanceOnlyPolicy().decide(c.get_observation()), Action.EVICT)
+
+    # Extra: overlapping slowdowns used to leave a machine stuck at the slowed speed.
+    def test_overlapping_slowdowns_recover_to_normal_speed(self) -> None:
+        sched = FaultSchedule([_slowdown(2, duration=5), _slowdown(4, duration=5)])
+        c = SimulatedCluster(seed=0)
+        for _ in range(20):
+            c.step_forward(sched)
+        m = c.machines["win-gpu-0"]
+        self.assertEqual(m.measured_speed, m.normal_speed)
+
+    # The planner the Oracle and MPC use must agree with what the cluster really does.
+    def test_plan_action_matches_cluster(self) -> None:
+        for action in (Action.WAIT, Action.REBALANCE, Action.COMPENSATE, Action.EVICT):
+            c = SimulatedCluster(seed=0)
+            c.inject_slowdown("win-gpu-0", 0.40, 300)
+            overhead, predicted = plan_action(c.get_observation(), action, "win-gpu-0")
+            t0 = c.sim_time
+            c.apply_action(action, "win-gpu-0")
+            _, actual = c.step_forward(FaultSchedule())
+            self.assertAlmostEqual(predicted, actual, places=9, msg=action.name)
+            self.assertAlmostEqual(overhead + actual, c.sim_time - t0, places=9, msg=action.name)
+
+    # Sanity check the team was missing: an Oracle that knows the future must not lose.
+    def test_oracle_never_worse_than_baselines(self) -> None:
+        for seed in range(5):
+            sched = RandomFaultGenerator(seed=seed).as_schedule()
+            best = run_episode(SimulatedCluster(seed), OraclePolicy(sched), sched, 1000).goodput_per_hr
+            for p in (DoNothingPolicy(), AlwaysRestartPolicy(), RebalanceOnlyPolicy(),
+                      TimeDelayedPolicy(10), TimeDelayedPolicy(60)):
+                other = run_episode(SimulatedCluster(seed), p, sched, 1000).goodput_per_hr
+                self.assertGreaterEqual(best, other * 0.99, f"seed {seed}: Oracle lost to {p.name}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
