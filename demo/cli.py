@@ -42,7 +42,6 @@ def parse(argv) -> argparse.Namespace:
     common.add_argument("--url", default=argparse.SUPPRESS,
                         help="controller address (default: the one `up` started, or 127.0.0.1:8000)")
     p = argparse.ArgumentParser(prog="python -m demo", description="Self-healing training demo", parents=[common])
-    p.set_defaults(url=None)
     sub = p.add_subparsers(dest="cmd", required=True)
     _add = sub.add_parser
     sub.add_parser = lambda *a, **k: _add(*a, parents=[common], **k)
@@ -143,8 +142,9 @@ def render_status(s: dict) -> Group:
 
 
 def _url(a: argparse.Namespace) -> str:
-    if a.url:
-        return a.url if a.url.startswith("http") else "http://" + a.url
+    url = getattr(a, "url", None)
+    if url:
+        return url if url.startswith("http") else "http://" + url
     try:
         with open(PIDS) as f:
             return f"http://127.0.0.1:{json.load(f)['port']}"
