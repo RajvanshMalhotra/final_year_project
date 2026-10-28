@@ -50,6 +50,8 @@ def parse(argv) -> argparse.Namespace:
     up.add_argument("--chaos", action="store_true", help="replay a simulator fault scenario")
     up.add_argument("--level", default="realistic", choices=["easy", "realistic", "hard", "chaos"])
     up.add_argument("--seed", type=int, default=3)
+    up.add_argument("--scenario-steps", type=int, default=450,
+                    help="squeeze the scenario's faults into this many training steps")
     up.add_argument("--port", type=int, default=8000)
     up.add_argument("--manual-load", action="store_true")
     up.add_argument("--no-spawn", action="store_true", help="nodes run on other machines")
@@ -163,7 +165,7 @@ def _call(url: str, method: str, path: str, body: Optional[dict]):
 def up(a: argparse.Namespace, con: Console) -> None:
     os.makedirs(RUNS, exist_ok=True)
     cmd = [sys.executable, "-m", "demo.controller", "--port", str(a.port), "--agent", a.agent,
-           "--level", a.level, "--seed", str(a.seed)]
+           "--level", a.level, "--seed", str(a.seed), "--scenario-steps", str(a.scenario_steps)]
     cmd += ["--chaos"] * a.chaos + ["--manual-load"] * a.manual_load + ["--no-spawn"] * a.no_spawn
     log = open(os.path.join(RUNS, "controller.log"), "a")
     p = subprocess.Popen(cmd, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)

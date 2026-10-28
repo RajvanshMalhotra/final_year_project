@@ -480,13 +480,18 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=3)
     p.add_argument("--manual-load", action="store_true", help="do not grow the workload automatically")
     p.add_argument("--no-spawn", action="store_true", help="nodes run elsewhere (the 3 real laptops)")
+    p.add_argument("--scenario-steps", type=int, default=1000,
+                   help="squeeze the scenario's faults into this many training steps")
+    p.add_argument("--host", help="address to listen on (default: this machine only; all with --no-spawn)")
     p.add_argument("--calibration", default=os.path.join(ROOT, "calibration.json"))
     a = p.parse_args()
     cfg = load_config(a.calibration)
-    cfg.scenario_level, cfg.scenario_seed = a.level, a.seed
+    cfg.scenario_level, cfg.scenario_seed, cfg.scenario_steps = a.level, a.seed, a.scenario_steps
+    # One-Mac demo: only this machine may connect (the API can kill nodes). Real laptops: open it.
+    host = a.host or ("0.0.0.0" if a.no_spawn else "127.0.0.1")
     ctl = Controller(cfg, port=a.port, store_port=a.store_port, agent_mode=a.agent, model_path=a.model,
                      chaos=a.chaos, auto_load=not a.manual_load, spawn_nodes=not a.no_spawn)
-    uvicorn.run(create_app(ctl), host="0.0.0.0", port=a.port, log_level="warning")
+    uvicorn.run(create_app(ctl), host=host, port=a.port, log_level="warning")
 
 
 if __name__ == "__main__":
