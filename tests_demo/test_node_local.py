@@ -122,3 +122,10 @@ def test_killed_member_makes_survivor_leave_with_group_failed():
     assert time.time() - t0 < 12
     survivor.join(10)
     del master
+
+
+def test_stacked_network_faults_never_make_a_step_look_like_a_crash():
+    from demo.node import GROUP_TIMEOUT_S
+    e = Emulator(link_s=0.05)
+    e.bandwidth = 0.36 * 0.07 * 0.36          # overlapping chaos faults: about 1% of normal
+    assert e.link_wait() < GROUP_TIMEOUT_S / 2

@@ -37,6 +37,7 @@ HEARTBEAT_S = 0.5
 GROUP_TIMEOUT_S = 5.0
 CHECKSUM_EVERY = 25
 COMPENSATE_SPEEDUP = 1.25   # same as simulator.COMPENSATE_SPEEDUP
+MIN_EMULATED_BANDWIDTH = 0.1   # stacked slow-link faults stay slow but never exceed the gloo timeout
 
 
 # ----------------------------------------------------------------------------- training maths
@@ -129,7 +130,7 @@ class Emulator:
         return max(0.0, count * self.sec_per_seq / max(self.effective_speed(), 1e-3) - compute_s)
 
     def link_wait(self) -> float:
-        return self.link_s / max(self.bandwidth, 1e-3) if self.enabled else 0.0
+        return self.link_s / max(self.bandwidth, MIN_EMULATED_BANDWIDTH) if self.enabled else 0.0
 
 
 # ----------------------------------------------------------------------------- one epoch
