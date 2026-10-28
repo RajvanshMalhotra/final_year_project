@@ -39,8 +39,10 @@ STATUS_STYLE = {"training": "green", "joining": "cyan", "waiting": "yellow", "id
 
 def parse(argv) -> argparse.Namespace:
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--url", help="controller address (default: the one `up` started, or 127.0.0.1:8000)")
+    common.add_argument("--url", default=argparse.SUPPRESS,
+                        help="controller address (default: the one `up` started, or 127.0.0.1:8000)")
     p = argparse.ArgumentParser(prog="python -m demo", description="Self-healing training demo", parents=[common])
+    p.set_defaults(url=None)
     sub = p.add_subparsers(dest="cmd", required=True)
     _add = sub.add_parser
     sub.add_parser = lambda *a, **k: _add(*a, parents=[common], **k)
