@@ -21,6 +21,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections import deque
 from typing import Dict, List, Optional, Set
 
 import torch.distributed as dist
@@ -108,6 +109,7 @@ class Controller:
         self._log = open(self.log_path, "a")
         self.store = None
         self.started = time.time()
+        self.timeline: deque = deque(maxlen=1000)    # 4 per second: what each node looked like
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -311,12 +313,23 @@ class Controller:
                         self.state.log(now, "reboot", f"{nid} restarted after its crash", nid)
                 await self._agent_tick(now)
                 if now - last_ui >= UI_EVERY_S:
+                    self._record(now)
                     await self.broadcast_ui(now)
                     last_ui = now
                 self._flush_events()
             except Exception as e:      # the demo must keep running; log and carry on
                 self.state.log(now, "error", f"controller loop: {e!r}")
             await asyncio.sleep(TICK_S)
+
+    def _record(self, now: float) -> None:
+        """Remember each node's status and speed, so a page opened later still shows the story."""
+        snap = self.state.snapshot(now)
+        st, sp = {}, {}
+        for n in snap["nodes"]:
+            slow = n["status"] == "training" and n["speed_ratio"] is not None and n["speed_ratio"] < 0.85
+            st[n["id"]] = "slow" if slow else n["status"]
+            sp[n["id"]] = None if n["status"] == "dead" or n["speed_ratio"] is None else round(n["speed_ratio"], 3)
+        self.timeline.append({"t": round(now, 2), "s": st, "v": sp})
 
     def snapshot(self, now: float, history: int = 600, events: int = 80) -> dict:
         s = self.state.snapshot(now)
@@ -328,6 +341,7 @@ class Controller:
             "decisions": self.decisions[-30:], "citations": self.cfg.citations,
             "reboot_in": {k: round(v - now, 1) for k, v in self.reboot_at.items() if v},
             "log_file": self.log_path,
+            "timeline": [x for x in self.timeline if x["t"] >= now - 245],
         })
         return s
 

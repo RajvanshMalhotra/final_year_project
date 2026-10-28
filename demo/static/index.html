@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Self-healing training</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="title">
+    <h1>Three laptops, one training job</h1>
+    <p class="sub" id="connection">Connecting to the controller…</p>
+  </div>
+  <dl class="readouts">
+    <div><dt>Training step</dt><dd id="r-step">–</dd></div>
+    <div><dt>Group</dt><dd id="r-group">–</dd></div>
+    <div><dt>Loss</dt><dd id="r-loss">–</dd></div>
+    <div><dt>Sequences per second</dt><dd id="r-rate">–</dd></div>
+  </dl>
+</header>
+
+<section class="controls" aria-label="Controls">
+  <div class="control">
+    <span class="control-name" id="agent-label">Who fixes faults</span>
+    <div class="segmented" role="radiogroup" aria-labelledby="agent-label">
+      <button data-agent="rl" role="radio">RL agent</button>
+      <button data-agent="rule" role="radio">Simple rule</button>
+      <button data-agent="off" role="radio">Nobody</button>
+    </div>
+  </div>
+  <div class="control">
+    <span class="control-name">Workload</span>
+    <div class="stepper">
+      <button id="load-down" aria-label="Less work per step">−4</button>
+      <output id="r-B">–</output><span class="unit">sequences per step</span>
+      <button id="load-up" aria-label="More work per step">+4</button>
+    </div>
+    <label class="switch"><input type="checkbox" id="load-auto"> grows by itself</label>
+  </div>
+  <div class="control">
+    <span class="control-name">Scenario faults</span>
+    <label class="switch"><input type="checkbox" id="chaos-on"> replay from the simulator</label>
+    <select id="chaos-level" aria-label="Scenario level">
+      <option value="realistic">realistic</option>
+      <option value="hard">hard</option>
+      <option value="chaos">chaos</option>
+      <option value="easy">easy</option>
+    </select>
+    <span class="hint" id="chaos-left"></span>
+  </div>
+</section>
+
+<main>
+  <section class="machines" id="machines" aria-label="The three machines"></section>
+
+  <section class="ribbon-wrap" aria-label="What happened, per machine">
+    <div class="section-head">
+      <h2>What happened to each machine</h2>
+      <p class="legend">
+        <span class="key healthy">training</span>
+        <span class="key slow">slower than its normal</span>
+        <span class="key waiting">waiting for others</span>
+        <span class="key dead">not responding</span>
+        <span class="key removed">removed</span>
+        <span class="key mark-fault">fault</span>
+        <span class="key mark-decision">agent decision</span>
+      </p>
+    </div>
+    <canvas id="ribbon" height="190" role="img" aria-label="Status of each machine over the last minutes, with faults and agent decisions"></canvas>
+  </section>
+
+  <section class="lower">
+    <div class="charts">
+      <figure>
+        <figcaption>Loss (lower is better)</figcaption>
+        <canvas id="chart-loss" height="170" role="img" aria-label="Training loss over time"></canvas>
+      </figure>
+      <figure>
+        <figcaption>Useful work: sequences trained per second</figcaption>
+        <canvas id="chart-rate" height="170" role="img" aria-label="Sequences per second over time"></canvas>
+      </figure>
+    </div>
+    <div class="feeds">
+      <h2>Agent decisions</h2>
+      <ol class="decisions" id="decisions"><li class="empty">No decisions yet. The agent starts after 15 warm-up steps.</li></ol>
+      <h2>Event log</h2>
+      <ol class="events" id="events"></ol>
+    </div>
+  </section>
+
+  <details class="about">
+    <summary>About this demo: what is real and what is emulated</summary>
+    <div class="about-body">
+      <p>Three separate programs train a small language model together and average their updates every step over the network (PyTorch gloo). A crash really kills the program; the others notice it from missing heartbeats. The agent is the model trained in our simulator, unchanged, fed with these live measurements.</p>
+      <p>Because all three programs share one Mac, the hardware differences are emulated with measured or published values:</p>
+      <ul id="citations"></ul>
+      <p class="hint" id="logfile"></p>
+    </div>
+  </details>
+</main>
+
+<template id="machine-tpl">
+  <article class="machine">
+    <div class="m-head">
+      <div>
+        <h3 class="m-name"></h3>
+        <p class="m-hw"></p>
+      </div>
+      <p class="m-status"></p>
+    </div>
+    <canvas class="m-trace" height="70" role="img"></canvas>
+    <div class="m-stats">
+      <div><span class="k">Speed vs normal</span><span class="v m-speed">–</span></div>
+      <div><span class="k">Share of work</span><span class="v m-share">–</span></div>
+      <div><span class="k">Sequences</span><span class="v m-count">–</span></div>
+      <div><span class="k">Heartbeat</span><span class="v m-hb">–</span></div>
+    </div>
+    <p class="m-faults"></p>
+    <div class="m-actions">
+      <button class="danger" data-act="crash">Crash</button>
+      <button data-act="slow">Slow down</button>
+      <button data-act="net">Slow link</button>
+      <button data-act="heal">Heal</button>
+    </div>
+  </article>
+</template>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
