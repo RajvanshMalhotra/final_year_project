@@ -34,12 +34,16 @@ CITATIONS: Dict[str, str] = {
     "crashes": "published: Llama 3 paper (Meta, 2024) - 419 unexpected interruptions in 54 days of "
                "pre-training, most from hardware. Demo crash count/timing from scenarios.make_scenario, "
                "time-compressed; a crash is a real SIGKILL of the node process.",
-    "network": "assumed: Wi-Fi 5 MB/s, 5 ms (calibration.json comm_s) until gloo_test.py / net_bench.py "
-               "results arrive; network faults cut a node's bandwidth by 50-95% (scenarios.py).",
+    "network": "assumed: the healthy link adds 0.05 s per step, the same share of a step as the "
+               "all-reduce time in the agent's training scenarios (scenarios.py realistic comm_s 0.03-0.08). "
+               "Measured Wi-Fi (calibration.json: 5 MB/s assumed, 20 MB/step measured) would make it ~4 s; "
+               "gloo_test.py will measure it. Network faults cut bandwidth by 50-95% (scenarios.py).",
     "workload": "input, not a measurement: the global batch grows in random jumps, like more work "
                 "being submitted.",
-    "pacing": "assumed: demo pacing - real compute time is stretched so one step on an 'NVIDIA' node "
-              "takes ~0.3 s and a person can follow it. Ratios between nodes are unaffected.",
+    "pacing": "assumed: demo pacing matched to the agent's training scenarios (simulator 'realistic' "
+              "level): one sequence takes 0.05 s on an 'NVIDIA' node, so a full batch on one NVIDIA node "
+              "takes about as long as in the simulator (1 batch / 3.5 per s). Real compute runs; the node "
+              "sleeps for the rest of its emulated time. Ratios between nodes come from 'speeds'.",
     "compensate": "assumed: lighter kernel = x1.25 speed (simulator.COMPENSATE_SPEEDUP).",
     "reboot": "assumed: a crashed laptop is back 15-40 s later (reboot + restart the program).",
 }
@@ -65,12 +69,11 @@ class DemoConfig:
     scenario_level: str = "realistic"
     scenario_seed: int = 3
     scenario_steps: int = 1000
-    stretch: float = 8.0          # see CITATIONS["pacing"]
+    sec_per_seq: float = 0.05     # emulated compute per sequence at speed_factor 1.0, see CITATIONS["pacing"]
+    link_s: float = 0.05          # emulated healthy link time per step, see CITATIONS["network"]
     ctx: int = 64
     lr: float = 3e-3
     data_seed: int = 0
-    grad_mb_emulated: float = 20.0   # emulated link carries the real 3B LoRA gradient size
-    wifi_mb_s: float = 50.0          # emulated healthy link for the demo pace; see CITATIONS["network"]
     citations: Dict[str, str] = field(default_factory=lambda: dict(CITATIONS))
 
     def node(self, nid: str) -> NodeSpec:
