@@ -94,3 +94,21 @@ def test_rl_mode_loads_model_and_acts():
     s = _running()
     action, target, info = runner.decide(build_observation(s, 1.7, 1))
     assert isinstance(action, Action)
+
+
+def test_rebalance_that_barely_changes_shares_becomes_wait():
+    class AlwaysRebalance:
+        def decide(self, obs):
+            return Action.REBALANCE
+
+    s = _running()
+    speeds = {nid: 1 / SPS[nid] for nid in IDS}
+    total = sum(speeds.values())
+    s.shares = {nid: v / total * (1.01 if nid == "mac-m2" else 1.0) for nid, v in speeds.items()}
+    runner = AgentRunner("off")
+    runner.policy = AlwaysRebalance()
+    action, _, info = runner.decide(build_observation(s, 1.7, 1))
+    assert action == Action.WAIT and "2%" in info["note"]
+    s.shares = {nid: 1 / 3 for nid in IDS}
+    action, _, _ = runner.decide(build_observation(s, 1.7, 1))
+    assert action == Action.REBALANCE

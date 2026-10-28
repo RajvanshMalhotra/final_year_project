@@ -14,7 +14,7 @@ import math
 from typing import Dict, List, Optional, Tuple
 
 from simulator import (
-    COMPENSATE_SPEEDUP, Action, MachineObs, Observation, ReactivePolicy, default_target,
+    COMPENSATE_SPEEDUP, SHARE_TOLERANCE, Action, MachineObs, Observation, ReactivePolicy, default_target,
     plan_action_full, proportional_shares,
 )
 
@@ -85,6 +85,13 @@ class AgentRunner:
             return Action.WAIT, None, {"note": f"ignored {action.name} {target or ''}: changes nothing"}
         if action not in (Action.REBALANCE, Action.COMPENSATE, Action.EVICT, Action.READMIT):
             return Action.WAIT, None, {"note": f"ignored {action.name}: not supported in the demo"}
+        if action == Action.REBALANCE:
+            # In the simulator a rebalance that changes nothing is free, so the agent presses it
+            # constantly; on real nodes each one is a message, so small changes are skipped.
+            new = _resplit(obs)
+            moved = max(abs(new.get(m, 0.0) - obs.machines[m].share) for m in NODE_IDS)
+            if moved < SHARE_TOLERANCE:
+                return Action.WAIT, None, {"note": f"skipped rebalance: shares within 2% ({moved:.1%})"}
         return action, target, {}
 
 
