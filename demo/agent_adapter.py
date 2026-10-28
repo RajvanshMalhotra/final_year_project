@@ -14,12 +14,12 @@ import math
 from typing import Dict, List, Optional, Tuple
 
 from simulator import (
-    COMPENSATE_SPEEDUP, SHARE_TOLERANCE, Action, MachineObs, Observation, ReactivePolicy, default_target,
+    COMPENSATE_SPEEDUP, SHARE_TOLERANCE, SLOW_RATIO_THRESHOLD, Action, MachineObs, Observation, ReactivePolicy, default_target,
     plan_action_full, proportional_shares,
 )
 
 from .config import NODE_IDS
-from .state import ClusterState, Msg
+from .state import WARMUP, ClusterState, Msg
 
 PRICES = {"mac-m2": 0.0, "win-gpu-0": 0.5, "win-gpu-1": 0.5}   # same as the simulator
 MODES = ("rl", "rule", "off")
@@ -54,6 +54,12 @@ def build_observation(state: ClusterState, now: float, tick: int) -> Observation
                        comm_s=comm_constant(state))
 
 
+def ready(state: ClusterState) -> bool:
+    """The agent acts only after the warm-up steps that define each node's normal speed
+    (before that every speed reads 0 and every node would look dead)."""
+    return state.step >= WARMUP[1]
+
+
 class AgentRunner:
     """mode 'rl' = trained MaskablePPO model, 'rule' = ReactivePolicy, 'off' = always WAIT."""
 
@@ -85,6 +91,13 @@ class AgentRunner:
             return Action.WAIT, None, {"note": f"ignored {action.name} {target or ''}: changes nothing"}
         if action not in (Action.REBALANCE, Action.COMPENSATE, Action.EVICT, Action.READMIT):
             return Action.WAIT, None, {"note": f"ignored {action.name}: not supported in the demo"}
+        if action == Action.COMPENSATE:
+            # The simulator only lets a truly slow machine switch to the lighter kernel; on live
+            # (noisy) measurements, "truly slow" = below the detector's 85% threshold.
+            m = obs.machines[target]
+            ratio = m.measured_speed / m.normal_speed if m.normal_speed else 1.0
+            if ratio >= SLOW_RATIO_THRESHOLD:
+                return Action.WAIT, None, {"note": f"skipped lighter mode for {target}: not slow ({ratio:.0%})"}
         if action == Action.REBALANCE:
             # In the simulator a rebalance that changes nothing is free, so the agent presses it
             # constantly; on real nodes each one is a message, so small changes are skipped.

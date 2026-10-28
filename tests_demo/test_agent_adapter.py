@@ -112,3 +112,29 @@ def test_rebalance_that_barely_changes_shares_becomes_wait():
     s.shares = {nid: 1 / 3 for nid in IDS}
     action, _, _ = runner.decide(build_observation(s, 1.7, 1))
     assert action == Action.REBALANCE
+
+
+def test_agent_waits_for_warmup_before_acting():
+    from demo.agent_adapter import ready
+    s = _running()                       # 16 steps reported
+    assert ready(s)
+    s.step = 3
+    assert not ready(s)
+
+
+def test_compensate_only_on_a_node_that_is_really_slow():
+    class Compensate:
+        def decide(self, obs):
+            return (Action.COMPENSATE, "mac-m2")
+
+    s = _running()
+    runner = AgentRunner("off")
+    runner.policy = Compensate()
+    s.on_report("mac-m2", {"epoch": s.epoch, "step": 17, "loss": 4.0, "count": 2, "sec_per_seq": SPS["mac-m2"] * 1.05,
+                           "net_s": 0.05, "comm_s": 0.06, "wall_s": 0.4, "B": 6}, 1.8)
+    action, _, info = runner.decide(build_observation(s, 1.8, 1))
+    assert action == Action.WAIT and "not slow" in info["note"]
+    s.on_report("mac-m2", {"epoch": s.epoch, "step": 18, "loss": 4.0, "count": 2, "sec_per_seq": SPS["mac-m2"] * 2,
+                           "net_s": 0.05, "comm_s": 0.06, "wall_s": 0.4, "B": 6}, 1.9)
+    action, target, _ = runner.decide(build_observation(s, 1.9, 1))
+    assert (action, target) == (Action.COMPENSATE, "mac-m2")

@@ -114,7 +114,7 @@ def accumulate_grads(model: nn.Module, x: torch.Tensor, y: torch.Tensor, cap: in
         xb, yb = x[i:i + cap], y[i:i + cap]
         loss = loss_fn(model, xb, yb) * (xb.shape[0] / n)
         loss.backward()
-        total += float(loss)
+        total += loss.item()
     return total
 
 

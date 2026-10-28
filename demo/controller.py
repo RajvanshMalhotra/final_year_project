@@ -30,7 +30,7 @@ from fastapi.staticfiles import StaticFiles
 
 from simulator import Action
 
-from .agent_adapter import AgentRunner, apply_action, build_observation, describe
+from .agent_adapter import AgentRunner, apply_action, build_observation, describe, ready
 from .chaos import ChaosPlayer, FaultBook, FaultCmd, Workload
 from .config import NODE_IDS, ROOT, DemoConfig, load_config
 from .state import ClusterState
@@ -267,14 +267,14 @@ class Controller:
         stepped = self.state.step > self.last_decided_step
         if not stepped and now - self.last_decision_t < STALL_DECIDE_S:
             return
-        if self.state.epoch == 0:
+        if self.state.epoch == 0 or not ready(self.state):
             return
         self.last_decided_step, self.last_decision_t = self.state.step, now
         self.tick += 1
         obs = build_observation(self.state, now, self.tick)
         action, target, info = self.runner.decide(obs)
         if action == Action.WAIT:
-            if info.get("note") and "skipped rebalance" not in info["note"]:
+            if info.get("note") and "skipped" not in info["note"]:
                 self.state.log(now, "agent_note", info["note"])
             return
         msgs = apply_action(action, target, obs, self.state, now)
