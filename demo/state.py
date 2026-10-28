@@ -112,6 +112,7 @@ class ClusterState:
         n.connected, n.ever_up, n.pid, n.last_hb = True, True, pid, now
         n.phase, n.has_state, n.held_step = "idle", has_state, step
         n.compensated, n.throttle, n.bw_factor = False, 1.0, 1.0
+        n.last_net = n.last_comm = None          # a fresh process: old link readings no longer apply
         self.log(now, "node_up", f"{nid} is up (pid {pid})", nid)
 
     def on_heartbeat(self, nid: str, now: float) -> None:
@@ -179,9 +180,11 @@ class ClusterState:
                                  "wall_s": wall, "samples_s": rep.get("B", self.B) / wall if wall else 0.0,
                                  "members": len(self.members)})
 
-    def on_probe(self, nid: str, sec_per_seq: float, now: float) -> None:
-        """An idle (evicted) node benchmarks itself so we can tell when it is healthy again."""
+    def on_probe(self, nid: str, sec_per_seq: float, now: float, net_s: Optional[float] = None) -> None:
+        """An idle (evicted) node benchmarks itself and its link, so we can tell when it is healthy again."""
         self._speed_sample(self.nodes[nid], sec_per_seq)
+        if net_s is not None:
+            self.nodes[nid].last_net = net_s
 
     @staticmethod
     def _speed_sample(n: NodeInfo, sps: float) -> None:

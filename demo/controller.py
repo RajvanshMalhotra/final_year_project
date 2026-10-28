@@ -181,7 +181,7 @@ class Controller:
                     self.state.on_left(nid, m["epoch"], m["reason"], m["step"], now)
                 elif t == "probe":
                     self.state.on_heartbeat(nid, now)
-                    self.state.on_probe(nid, m["sec_per_seq"], now)
+                    self.state.on_probe(nid, m["sec_per_seq"], now, m.get("net_s"))
         except (WebSocketDisconnect, RuntimeError, json.JSONDecodeError):
             pass
         finally:

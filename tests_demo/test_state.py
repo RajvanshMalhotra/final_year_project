@@ -167,3 +167,25 @@ def test_rebalance_and_set_B_go_to_rank0_as_config():
     v = out[0][1]["version"]
     out2 = s.set_B(10, now=2.0)
     assert out2[0][1]["B"] == 10 and out2[0][1]["version"] == v + 1
+
+
+def test_idle_probe_refreshes_link_speed_so_a_healed_node_can_be_readmitted():
+    s = _state()
+    _up(s)
+    _join_all(s, s.maybe_form_epoch(0.0), 0.1)
+    for step in range(1, 16):
+        _report(s, "mac-m2", 1, step, step * 0.1, net=0.05)
+    _report(s, "mac-m2", 1, 16, 1.7, net=0.25)          # slow-network fault while in the group
+    assert s.node_view("mac-m2", 1.8)["bandwidth"] < 0.5
+    s.on_probe("mac-m2", 0.05, 2.0, net_s=0.05)          # evicted node, fault healed
+    assert s.node_view("mac-m2", 2.1)["bandwidth"] == 1.0
+
+
+def test_restarted_process_starts_with_a_fresh_link_reading():
+    s = _state()
+    _up(s)
+    _join_all(s, s.maybe_form_epoch(0.0), 0.1)
+    for step in range(1, 17):
+        _report(s, "mac-m2", 1, step, step * 0.1, net=0.05 if step < 16 else 0.5)
+    s.on_hello("mac-m2", pid=7, has_state=False, step=-1, now=5.0)
+    assert s.node_view("mac-m2", 5.1)["bandwidth"] == 1.0

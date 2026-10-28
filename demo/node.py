@@ -218,8 +218,8 @@ def run_epoch(tr: Trainer, emu: Emulator, msg: dict, store: dist.Store, inbox: I
             pass
 
 
-def probe(tr: Trainer, emu: Emulator, sleep=time.sleep) -> float:
-    """Idle health check: time two sequences (with emulation) without changing the model."""
+def probe(tr: Trainer, emu: Emulator, sleep=time.sleep) -> Tuple[float, float]:
+    """Idle health check: time two sequences and the link (with emulation) without changing the model."""
     x, y = tinygpt.batch_for_step(tr.data, 10**6 + tr.step, 2, tr.ctx, tr.data_seed)
     t0 = time.perf_counter()
     tinygpt.accumulate_grads(tr.model, x, y, 2)
@@ -228,7 +228,11 @@ def probe(tr: Trainer, emu: Emulator, sleep=time.sleep) -> float:
     if wait:
         sleep(wait)
     tr.model.zero_grad(set_to_none=False)
-    return (compute_s + wait) / 2
+    t0 = time.perf_counter()
+    link = emu.link_wait()
+    if link:
+        sleep(link)
+    return (compute_s + wait) / 2, time.perf_counter() - t0
 
 
 # ----------------------------------------------------------------------------- control client
@@ -307,7 +311,8 @@ class NodeClient:
                 msg = self.inbox.epochs.get(timeout=0.2)
             except queue.Empty:
                 if time.time() - last_probe >= 1.0:      # idle: report health so we can be readmitted
-                    self.send({"type": "probe", "sec_per_seq": probe(tr, self.emu)})
+                    sps, net_s = probe(tr, self.emu)
+                    self.send({"type": "probe", "sec_per_seq": sps, "net_s": net_s})
                     last_probe = time.time()
                 continue
             if msg["epoch"] <= epoch_seen:
