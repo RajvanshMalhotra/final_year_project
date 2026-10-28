@@ -274,6 +274,8 @@ class NodeClient:
                     self.emu.bandwidth = float(m["factor"])
                 elif t == "compensate":
                     self.emu.compensated = bool(m["on"])
+                elif t == "die":           # injected crash on a real laptop (no SIGKILL across machines)
+                    os._exit(137)
                 elif t == "shutdown":
                     break
         except Exception:
