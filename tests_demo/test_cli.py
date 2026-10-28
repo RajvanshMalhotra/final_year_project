@@ -47,3 +47,8 @@ def test_status_table_shows_every_node_and_the_cluster_line():
     for word in ("mac-m2", "win-gpu-0", "win-gpu-1", "training", "dead", "epoch 3", "step 120",
                  "agent rl", "75%", "restarts in 12"):
         assert word in out, word
+
+
+def test_url_works_before_or_after_the_command():
+    assert parse(["--url", "1.2.3.4:8000", "status"]).url == "1.2.3.4:8000"
+    assert parse(["down", "--url", "1.2.3.4:8000"]).url == "1.2.3.4:8000"

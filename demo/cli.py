@@ -38,9 +38,12 @@ STATUS_STYLE = {"training": "green", "joining": "cyan", "waiting": "yellow", "id
 
 
 def parse(argv) -> argparse.Namespace:
-    p = argparse.ArgumentParser(prog="python -m demo", description="Self-healing training demo")
-    p.add_argument("--url", help="controller address (default: the one `up` started, or 127.0.0.1:8000)")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--url", help="controller address (default: the one `up` started, or 127.0.0.1:8000)")
+    p = argparse.ArgumentParser(prog="python -m demo", description="Self-healing training demo", parents=[common])
     sub = p.add_subparsers(dest="cmd", required=True)
+    _add = sub.add_parser
+    sub.add_parser = lambda *a, **k: _add(*a, parents=[common], **k)
     up = sub.add_parser("up", help="start the controller and three nodes, open the web page")
     up.add_argument("--agent", default="rl", choices=["rl", "rule", "off"])
     up.add_argument("--chaos", action="store_true", help="replay a simulator fault scenario")
